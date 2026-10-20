@@ -1,0 +1,143 @@
+# SlickAI.Muse — one question to the Muse that is installed here.
+#
+#   SlickAI.Mind.answered(Muse(Local {}), "You are…", turns, Ask { prompt: "Hello" })
+#
+# It runs Muse's `muse exec`, so it answers as whoever is signed in to Muse
+# on this machine: no API key, and nothing to pay per request beyond what
+# that account already is.
+#
+# Muse on its own judges what it may do without asking. Whoever can write in
+# Slick decides what it is asked, so the bot gates its tools itself instead:
+#
+#   - With `allowed` empty it is run with writing files, the shell and the
+#     web all taken away, and keeps no session: it can only answer in words.
+#     Reading files cannot be taken away.
+#   - With tools allowed, it is run in `directory`, and keeps a session
+#     there is one conversation in: `SlickAI.Mind.begins` opens one, the
+#     first answer is asked with the whole conversation, and the next `Ask`
+#     names the session and says only what is new. What it is allowed is
+#     named per tool — Bash, Write or Web — and anything else stays taken
+#     away.
+#
+# A Muse that needs a tool it does not have says so on a line of its own —
+# `NEED TOOL Bash: ls -la` — which is what the bot asks a person about; it
+# is taken out of its words (`Mind.Answer.wanted`, `Mind.transcript`).
+module SlickAI.Muse
+
+using Random
+using SlickAI.Mind, only: [Ask, Answer, Want]
+
+record Local do
+  # The program: `muse` wherever PATH finds it, unless told otherwise.
+  command : String = "muse"
+  # The model, as `muse exec --model` takes it; "" is Muse's own choice.
+  model : String = ""
+  # How hard it thinks, as `muse exec --reasoning-effort` takes it;
+  # "" is Muse's own choice.
+  effort : String = ""
+  # How long an answer may take.
+  seconds : Integer = 120
+  # The tools it may be allowed, by name: "Bash" (the shell), "Write"
+  # (writing files) and "Web" (the web). Reading files needs no
+  # permission, and so is never among them.
+  tools : [String] = []
+  # Where it runs when it has tools: what it can read without asking.
+  directory : String = ""
+end
+
+# The tools there are, by name.
+let KNOWN = ["Bash", "Write", "Web"]
+
+# What a line starts with when it asks for a tool.
+let NEED = "NEED TOOL "
+
+# The arguments `muse` is run with: one headless `exec` with what is not
+# allowed taken away, in the conversation's session when there is one, and
+# the prompt last.
+arguments : Local -> String -> Ask -> [String]
+let arguments(local, system, ask) do
+  let model = !ask.model.empty? then ["--model", ask.model] else (local.model.empty? then [] else ["--model", local.model])
+  let effort = local.effort.empty? then [] else ["--reasoning-effort", local.effort]
+  let session = ask.session.empty? then ["--no-session-log"] else ["--session-id", ask.session]
+  ["exec"] + gated(ask.allowed) + model + effort + session + ["${system}\n\n${ask.prompt}"]
+end
+
+# A new session for a conversation to go on in: a random UUID, which is
+# what `muse exec --session-id` takes.
+foul session() -> String do
+  let hex = Random.secureBytes(16).hex
+  let (variant, _) = Random.fresh.choice(["8", "9", "a", "b"])
+  let v = variant.or("8")
+  "${hex.take(8)}-${hex.drop(8).take(4)}-4${hex.drop(13).take(3)}-${v}${hex.drop(17).take(3)}-${hex.drop(20)}"
+end
+
+# What Muse said: whatever it printed, when it exited well and printed
+# something — the `NEED TOOL` lines taken out of its words, and kept as what
+# it was refused on the way to.
+said : Integer -> String -> Result<Answer, String>
+let said(exitCode, printed) do
+  let words = cleaned(printed)
+  return Error("muse exited ${exitCode} without an answer") if exitCode != 0 || words.empty?
+
+  Ok(Answer { text: words, wanted: wants(printed) })
+end
+
+# Asks the local Muse.
+answered : Local -> String -> Ask -> Result<Answer, String>
+foul answered(local, system, ask) do
+  let run = arguments(local, system, ask)
+  let placed = ["-c", THERE, "sh", local.directory, local.command] + run
+  let program = local.directory.empty? then local.command else "sh"
+  match SlickAI.Shell.run(program, local.directory.empty? then run else placed, local.seconds) do
+    Ok((exitCode, printed)) => return said(exitCode, printed)
+    Error(reason) => return Error("${local.command} could not be run: ${reason}")
+  end
+end
+
+# The tools an answer asks for, one for each of its `NEED TOOL` lines:
+# `NEED TOOL Bash: ls -la` wants Bash, to run `ls -la`.
+wants : String -> [Want]
+let wants(answer) do
+  answer.split("\n").flatMap { |line| need(line.trim) }
+end
+
+# An answer as it is said: with the `NEED TOOL` lines taken out.
+cleaned : String -> String
+let cleaned(answer) do
+  answer.split("\n").reject { |line| line.trim.startsWith?(NEED) }.join("\n").trim
+end
+
+private do
+  # Runs a program in a directory, made if it is not there, with nothing to
+  # read from: `sh -c THERE sh <directory> <program> <arguments…>`.
+  let THERE = "mkdir -p \"$1\" && cd \"$1\" && shift && exec \"$@\" </dev/null"
+
+  # What is taken away when these tools are the ones allowed: the flag
+  # for each of the tools there are that is not among them.
+  gated : [String] -> [String]
+  let gated(allowed) do
+    KNOWN.flatMap { |tool|
+      allowed.contains?(tool) then [] else [flag(tool)]
+    }
+  end
+
+  # The flag that takes a tool away.
+  flag : String -> String
+  let flag(tool) do
+    return "--disable-shell" if tool == "Bash"
+    return "--disable-write" if tool == "Write"
+    return "--disable-web-tools"
+  end
+
+  # What one line asks for, when it is a `NEED TOOL` line.
+  need : String -> [Want]
+  let need(line) do
+    return [] if !line.startsWith?(NEED)
+
+    let parts = line.drop(NEED.count).split(": ")
+    let tool = parts.first.or("").trim
+    return [] if tool.empty?
+
+    [Want { tool: tool, detail: parts.drop(1).join(": ").trim.take(600) }]
+  end
+end

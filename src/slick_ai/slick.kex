@@ -1,0 +1,318 @@
+# SlickAI.Slick — Slick's bot API, as much of it as this bot uses.
+#
+#   let slick = Slick { base: "http://127.0.0.1:4000", token: token }
+#   SlickAI.Slick.me(slick)
+#   SlickAI.Slick.recent(slick, "acme", channel("general"))
+#   SlickAI.Slick.say(slick, "acme", channel("general"), message.id, "Hello")
+#   SlickAI.Slick.say(slick, "acme", chat(person), "", "Hello")
+#
+# A conversation is named by its place in an organization: `channel(name)`,
+# `group(id)` for a group chat, or `chat(person)` for the private chat with
+# somebody.
+#
+# Every call is one request through `SlickAI.Wire`, and an answer that is
+# not a 2xx is an `Error` carrying what Slick said. What happens as it
+# happens is the one thing that is not a request: `stream` opens Slick's
+# /api/events WebSocket (`App.Live.Events`, in Slick).
+module SlickAI.Slick
+
+using JSON
+
+# Where Slick is, and the bot's token there.
+record Slick do
+  base : String
+  token : String
+end
+
+# Who the token says this bot is.
+record Identity do
+  id : String
+  name : String
+  # The addresses of the organizations it is in.
+  organizations : [String] = []
+end
+
+# One message, as far as the bot reads it.
+record Message do
+  id : String
+  userId : String = ""
+  author : String = ""
+  bot? : Bool = false
+  body : String = ""
+  sentAt : Integer = 0
+  # The message this one replies to; "" for one said in the channel itself.
+  thread : String = ""
+  replies : Integer = 0
+end
+
+# What somebody answered a form in one of the bot's own messages with:
+# where that message is, who answered, and what the answer says. Slick only
+# tells a bot the answers to forms it asked itself, given by using the form.
+#
+# (`Given`, and not `Reply`: that is what a `serving` slot answers with, and
+# a record of the same name is taken for it.)
+record Given do
+  message : String
+  # The conversation the message is in, as a place, and the thread it is
+  # in there; "" when it is said in the conversation itself.
+  place : String = ""
+  thread : String = ""
+  userId : String = ""
+  author : String = ""
+  answer : String = ""
+  answeredAt : Integer = 0
+end
+
+# A slash command somebody used for the bot — Slick's composer turns
+# `/mode auto` into one, not a message — and where: the conversation as a
+# place, and the thread there; "" when it was used in the conversation
+# itself.
+record Use do
+  id : String
+  # Without the slash: "mode".
+  command : String
+  # What was written after it: "auto", or "".
+  arguments : String = ""
+  place : String = ""
+  thread : String = ""
+  userId : String = ""
+  author : String = ""
+  invokedAt : Integer = 0
+end
+
+# One thing Slick told the bot happened: where, never what. `kind` is
+# "message", "answer" or "command", and `cursor` is how far the bot has now
+# been told of — the number to bring on the next connection.
+record Happening do
+  kind : String
+  organization : String = ""
+  place : String = ""
+  thread : String = ""
+  message : String = ""
+  at : Integer = 0
+  cursor : Integer = 0
+end
+
+# The most messages of a channel looked at in one go.
+let WINDOW = 100
+
+me : Slick -> Result<Identity, String>
+foul me(slick) do
+  let fields : {String: Any} = asked(slick, "GET", "/api/me", "").try
+  let listed : [Any] = fields.get("organizations").or([])
+  let slugs = listed.map { |each|
+    let organization : {String: Any} = each
+    "${organization.get("slug").or("")}"
+  }
+  return Ok(Identity { id: text(fields, "id"), name: text(fields, "name"), organizations: slugs })
+end
+
+# A channel's place in its organization.
+channel : String -> String
+let channel(name) = "channels/${name}"
+
+# The place of the private chat with a person.
+chat : String -> String
+let chat(person) = "dm/${person}"
+
+# A group chat's place in its organization.
+group : String -> String
+let group(id) = "groups/${id}"
+
+# The names of an organization's channels.
+channels : Slick -> String -> Result<[String], String>
+foul channels(slick, organization) do
+  let listed : [Any] = asked(slick, "GET", "/api/${organization}/channels", "").try
+  return Ok(listed.map { |each|
+    let found : {String: Any} = each
+    text(found, "name")
+  })
+end
+
+# The group chats the bot is in, in an organization: each by its id.
+groups : Slick -> String -> Result<[String], String>
+foul groups(slick, organization) do
+  let listed : [Any] = asked(slick, "GET", "/api/${organization}/groups", "").try
+  return Ok(listed.map { |each|
+    let found : {String: Any} = each
+    text(found, "id")
+  })
+end
+
+# The people the bot has a private chat with — not the other bots.
+chats : Slick -> String -> Result<[String], String>
+foul chats(slick, organization) do
+  let listed : [Any] = asked(slick, "GET", "/api/${organization}/dm", "").try
+  return Ok(listed.flatMap { |each|
+    let found : {String: Any} = each
+    found.get("bot").or(false) == true then [] else [text(found, "person")]
+  })
+end
+
+# The answers to the forms in the bot's own messages, given later than
+# `since` (milliseconds since 1970), oldest first.
+answers : Slick -> String -> Integer -> Result<[Given], String>
+foul answers(slick, organization, since) do
+  let listed : [Any] = asked(slick, "GET", "/api/${organization}/answers?after=${since}", "").try
+  return Ok(listed.map { |each|
+    let found : {String: Any} = each
+    let name = text(found, "channel")
+    let grouping = text(found, "group")
+    Given {
+      message: text(found, "message"),
+      place: !name.empty? then channel(name) else (!grouping.empty? then group(grouping) else chat(text(found, "person"))),
+      thread: text(found, "thread"),
+      userId: text(found, "user"),
+      author: text(found, "author"),
+      answer: text(found, "answer"),
+      answeredAt: whole(found, "answeredAt")
+    }
+  })
+end
+
+# The slash commands used for the bot in an organization since `since`,
+# oldest first.
+invocations : Slick -> String -> Integer -> Result<[Use], String>
+foul invocations(slick, organization, since) do
+  let listed : [Any] = asked(slick, "GET", "/api/${organization}/invocations?after=${since}", "").try
+  return Ok(listed.map { |each|
+    let found : {String: Any} = each
+    let name = text(found, "channel")
+    let grouping = text(found, "group")
+    Use {
+      id: text(found, "id"),
+      command: text(found, "command"),
+      arguments: text(found, "arguments"),
+      place: !name.empty? then channel(name) else (!grouping.empty? then group(grouping) else chat(text(found, "person"))),
+      thread: text(found, "thread"),
+      userId: text(found, "user"),
+      author: text(found, "author"),
+      invokedAt: whole(found, "invokedAt")
+    }
+  })
+end
+
+# The newest messages said in a conversation itself, oldest first. Replies
+# are not among them, but each message says how many it has.
+recent : Slick -> String -> String -> Result<[Message], String>
+foul recent(slick, organization, place) do
+  let path = "/api/${organization}/${place}/messages?limit=${WINDOW}"
+  let listed : [Any] = asked(slick, "GET", path, "").try
+  return Ok(listed.map { |each| message(each) })
+end
+
+# A thread: the message it hangs from, then its replies, oldest first.
+thread : Slick -> String -> String -> String -> Result<[Message], String>
+foul thread(slick, organization, place, root) do
+  let path = "/api/${organization}/${place}/messages?thread=${root}"
+  let listed : [Any] = asked(slick, "GET", path, "").try
+  return Ok(listed.map { |each| message(each) })
+end
+
+# Says something: in the thread of `root`, or in the conversation itself
+# when `root` is "".
+say : Slick -> String -> String -> String -> String -> Result<Message, String>
+foul say(slick, organization, place, root, body) do
+  let path = "/api/${organization}/${place}/messages"
+  let words = root.empty? then JSON.stringify({"body": body}) else JSON.stringify({"body": body, "thread": root})
+  let sent = asked(slick, "POST", path, words).try
+  return Ok(message(sent))
+end
+
+# Says what the bot is doing in a conversation, for `seconds` or until it
+# speaks.
+noting : Slick -> String -> String -> String -> Integer -> Result<Bool, String>
+foul noting(slick, organization, place, words, seconds) do
+  let path = "/api/${organization}/${place}/status"
+  asked(slick, "POST", path, JSON.stringify({"text": words, "seconds": seconds})).try
+  return Ok(true)
+end
+
+# Tells Slick the slash commands the bot answers to — each a name, without
+# the slash, and what it does — so its composer can offer them.
+announced : Slick -> [(String, String)] -> Result<Bool, String>
+foul announced(slick, commands) do
+  let listed : [Any] = commands.map { |command|
+    match command do
+      (name, description) => do
+        let entry : {String: Any} = {"name": name, "description": description}
+        entry
+      end
+    end
+  }
+  asked(slick, "PUT", "/api/commands", JSON.stringify({"commands": listed})).try
+  return Ok(true)
+end
+
+# The address of the stream of what happens, carrying how far the bot has
+# already been told (`after`) and the token — the one way a WebSocket client
+# can send it.
+stream : Slick -> Integer -> String
+let stream(slick, after) do
+  let root = slick.base.replace("http://", "ws://").replace("https://", "wss://")
+  "${root}/api/events?after=${after}&token=${slick.token}"
+end
+
+# What the stream said: `Again` — start again, with one full look, from the
+# cursor; `CaughtUp` — the telling of what was missed has ended, and what
+# comes now happens as it happens; `One` — one thing happened.
+type Told = Again(Integer) | CaughtUp(Integer) | One(Happening)
+
+# One telling off the stream: a happening, or the stream's own words.
+read : String -> Result<Told, String>
+foul read(said) do
+  match JSON.parse(said) do
+    Error(reason) => return Error("Slick told something that is not JSON: ${reason}")
+    Ok(value) => do
+      let fields : {String: Any} = value
+      let cursor = whole(fields, "cursor")
+      let kind = text(fields, "kind")
+      return Ok(Again(cursor)) if kind == "reset"
+      return Ok(CaughtUp(cursor)) if kind == "ready"
+      return Ok(One(Happening {
+        kind: kind,
+        organization: text(fields, "organization"),
+        place: text(fields, "place"),
+        thread: text(fields, "thread"),
+        message: text(fields, "message"),
+        at: whole(fields, "at"),
+        cursor: cursor
+      }))
+    end
+  end
+end
+
+private do
+  # One request, and the JSON it was answered with.
+  foul asked(slick: Slick, method: String, path: String, body: String) -> Result<Any, String> do
+    let headers = [("Authorization", "Bearer ${slick.token}")]
+    let (status, answer) = SlickAI.Wire.send(method, "${slick.base}${path}", headers, body).try
+    return Error("Slick answered ${status} to ${method} ${path}: ${answer}") if status < 200 || status > 299
+
+    match JSON.parse(answer) do
+      Ok(value) => return Ok(value)
+      Error(reason) => return Error("Slick answered ${method} ${path} with something that is not JSON: ${reason}")
+    end
+  end
+
+  message : Any -> Message
+  let message(value) do
+    let fields : {String: Any} = value
+    Message {
+      id: text(fields, "id"),
+      userId: text(fields, "user"),
+      author: text(fields, "author"),
+      bot?: fields.get("bot").or(false) == true,
+      body: text(fields, "body"),
+      sentAt: whole(fields, "sentAt"),
+      thread: text(fields, "thread"),
+      replies: whole(fields, "replies")
+    }
+  end
+
+  text : {String: Any} -> String -> String
+  let text(fields, name) = "${fields.get(name).or("")}"
+
+  whole : {String: Any} -> String -> Integer
+  let whole(fields, name) = "${fields.get(name).or(0)}".to(Integer).or(0)
+end

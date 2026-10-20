@@ -1,0 +1,19 @@
+# SlickAI.Files — the one way to lay out the directory a provider runs in.
+#
+# Each OpenCode run gets the permissions it was asked with, as the project's
+# own `opencode.json` — what is allowed, what is asked about, and nothing
+# else. A spec replaces it, the way it replaces `SlickAI.Shell`.
+using FS
+
+capability SlickAI.Files do
+  # Writes `content` as `opencode.json` in `directory`, made if it is not
+  # there. Whether it is now what it was written: when it is not, the run it
+  # was written for must not happen, since the permissions there would be
+  # somebody else's.
+  foul place(directory: String, content: String) -> Bool do
+    if !FS.Directory.exists?(directory)
+      return false if !FS.Directory.create(directory)
+    end
+    return FS.File.write("${directory}/opencode.json", content).ok?
+  end
+end

@@ -1,0 +1,12 @@
+package "slick-ai-bot" do
+  version("0.1.0")
+  description("An AI as a bot in Slick: Muse, OpenCode or Claude — one at a time, or all three in one bot")
+  kex(">= 0.4.0-rc.2")
+
+  entrypoint("src/main.kex")
+
+  command("muse", run: "tey run muse", description: "A Slick bot that asks the local Muse")
+  command("opencode", run: "tey run opencode", description: "A Slick bot that asks the local OpenCode")
+  command("claude", run: "tey run claude", description: "A Slick bot that asks Claude Code, or Anthropic's API")
+  command("all", run: "tey run all", description: "One Slick bot that asks whichever of them it is told to, per conversation")
+end

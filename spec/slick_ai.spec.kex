@@ -1,0 +1,243 @@
+using JSON
+using SlickAI.Slick, only: [Slick, Identity, Message, Happening, Again, CaughtUp, One]
+using SlickAI.Claude, only: [Settings]
+using SlickAI.Mind, only: [Turn, Ask, Api, Code, Muse, OpenCode]
+using SlickAI.Bot, only: [Bot]
+
+# What a scripted network was asked, in order.
+record Recorder do
+  calls : [String] = []
+end
+
+serving Recorder do
+  foul slot noted(call: String) -> Reply<Bool> do
+    new.calls = @calls + [call]
+    return { new, reply: true }
+  end
+
+  foul slot listed -> Reply<[String]> do
+    return { reply: @calls }
+  end
+end
+
+# A network that answers from a script — "METHOD url" to the JSON said back
+# — notes every request, and answers 404 to anything it was not told about.
+record Scripted do
+  recorder : Server<Recorder>
+  answers : {String: String} = {}
+end
+
+make Scripted, implement: SlickAI.Wire do
+  foul send(method: String, url: String, headers: [(String, String)], body: String) -> Result<(Integer, String), String> do
+    @recorder.noted("${method} ${url} ${body}")
+    match @answers.get("${method} ${url}") do
+      Just(answer) => return Ok((200, answer))
+      None => return Ok((404, "{\"error\":\"not scripted\"}"))
+    end
+  end
+
+  foul open(url: String) -> Result<Net.HTTP.WebSocket.Connection, String> do
+    @recorder.noted("OPEN ${url}")
+    return Error("no socket in a spec")
+  end
+end
+
+let slick = Slick { base: "http://slick.test", token: "slick_bot_spec" }
+let identity = Identity { id: "b1", name: "slick", organizations: ["acme"] }
+let api = Api(Settings { key: "sk-ant-spec", base: "http://anthropic.test" })
+
+let ada = Message { id: "m1", userId: "u1", author: "Ada", body: "@slick what is 2 + 2?" }
+let four = Message { id: "m2", userId: "b1", author: "slick", bot?: true, body: "4", thread: "m1" }
+let more = Message { id: "m3", userId: "u2", author: "Bob", body: "and 3 + 3?", thread: "m1" }
+
+# A message as Slick's API tells it.
+let told(message: Message, replies: Integer) -> {String: Any} do
+  let fields : {String: Any} = {
+    "id": message.id,
+    "user": message.userId,
+    "author": message.author,
+    "bot": message.bot?,
+    "body": message.body,
+    "sentAt": 1,
+    "thread": message.thread,
+    "replies": replies
+  }
+  return fields
+end
+
+let CHANNELS = "GET http://slick.test/api/acme/channels"
+let GROUPS = "GET http://slick.test/api/acme/groups"
+let CHATS = "GET http://slick.test/api/acme/dm"
+let RECENT = "GET http://slick.test/api/acme/channels/general/messages?limit=100"
+let THREAD = "GET http://slick.test/api/acme/channels/general/messages?thread=m1"
+let POST = "POST http://slick.test/api/acme/channels/general/messages"
+let STATUS = "POST http://slick.test/api/acme/channels/general/status"
+let ASK = "POST http://anthropic.test/v1/messages"
+let ANSWER = "{\"content\":[{\"type\":\"text\",\"text\":\"It is 4.\"}],\"stop_reason\":\"end_turn\"}"
+
+let answersSince(moment: Integer) -> String = "GET http://slick.test/api/acme/answers?after=${moment}"
+let usedSince(moment: Integer) -> String = "GET http://slick.test/api/acme/invocations?after=${moment}"
+
+# The script of one full look: an empty channel list with the messages the
+# bot is shown, and its thread.
+let script(recent: [Any], thread: [Any]) -> {String: String} do
+  let none : {String: String} = {}
+  return none
+    .put(CHANNELS, "[{\"id\":\"c1\",\"name\":\"general\",\"topic\":\"\"}]")
+    .put(GROUPS, "[]")
+    .put(CHATS, "[]")
+    .put(answersSince(0), "[]")
+    .put(usedSince(0), "[]")
+    .put(RECENT, JSON.stringify(recent))
+    .put(THREAD, JSON.stringify(thread))
+    .put(POST, JSON.stringify(told(four, 0)))
+    .put(STATUS, "{\"ok\":true}")
+    .put(ASK, ANSWER)
+end
+
+# One full look at Slick over a scripted network; the bot afterwards.
+foul looked(bot: Bot, recorder: Server<Recorder>, answers: {String: String}) -> Bot do
+  with SlickAI.Wire = Scripted { recorder: recorder, answers: answers } do
+    return SlickAI.Bot.polled(bot)
+  end
+end
+
+describe("SlickAI.Slick, reading the stream") do
+  it("reads a happening, and the stream's own words apart") do
+    let one = SlickAI.Slick.read("{\"kind\":\"message\",\"cursor\":9,\"organization\":\"acme\",\"place\":\"channels/general\",\"thread\":\"\",\"message\":\"m1\",\"at\":100}")
+    match one do
+      Ok(One(happening)) => do
+        Assert.equal(happening.kind, "message")
+        Assert.equal(happening.place, "channels/general")
+        Assert.equal(happening.cursor, 9)
+      end
+      _ => Assert.falsy(true)
+    end
+    Assert.equal(SlickAI.Slick.read("{\"kind\":\"reset\",\"cursor\":41}"), Ok(Again(41)))
+    Assert.equal(SlickAI.Slick.read("{\"kind\":\"ready\",\"cursor\":42}"), Ok(CaughtUp(42)))
+    match SlickAI.Slick.read("not json") do
+      Error(_) => Assert.truthy(true)
+      Ok(_) => Assert.falsy(true)
+    end
+  end
+
+  it("names the stream by its address and the bot's token") do
+    Assert.equal(SlickAI.Slick.stream(Slick { base: "http://slick.test", token: "t" }, 5),
+                 "ws://slick.test/api/events?after=5&token=t")
+  end
+end
+
+describe("SlickAI.Mind") do
+  it("marks a conversation out of the turns, the bot's own as its own") do
+    Assert.equal(SlickAI.Mind.transcript([Turn { role: "user", text: "Hi" }]), "Hi")
+    Assert.equal(
+      SlickAI.Mind.transcript([Turn { role: "user", text: "Hi" }, Turn { role: "assistant", text: "Yo" }]),
+      "The conversation so far, oldest first:\n\nHi\n\nYou: Yo\n\nAnswer the newest message."
+    )
+  end
+
+  it("knows which minds have tools, and how they are named") do
+    Assert.falsy(SlickAI.Mind.tooled?(api))
+    Assert.truthy(SlickAI.Mind.named(api).contains?("Anthropic"))
+    Assert.falsy(SlickAI.Mind.gated?(api))
+    Assert.equal(SlickAI.Mind.offered(api), [])
+  end
+end
+
+describe("SlickAI.Bot, deciding") do
+  let bot = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity, operators: ["u1"] }
+
+  it("is asked for by its name, however it is cased") do
+    Assert.truthy(SlickAI.Bot.mentions?("slick", "hey @Slick, a question"))
+    Assert.falsy(SlickAI.Bot.mentions?("slick", "slick is a nice name"))
+  end
+
+  it("speaks in a thread it was asked into, when a person spoke last") do
+    Assert.truthy(SlickAI.Bot.due?(identity, [ada]))
+    Assert.falsy(SlickAI.Bot.due?(identity, [ada, four]))
+    Assert.truthy(SlickAI.Bot.due?(identity, [ada, four, more]))
+    Assert.falsy(SlickAI.Bot.due?(identity, []))
+  end
+
+  it("reads a thread as a conversation that changes sides at every turn") do
+    Assert.equal(SlickAI.Bot.conversation("b1", [ada, four, more]), [
+      Turn { role: "user", text: "Ada: @slick what is 2 + 2?" },
+      Turn { role: "assistant", text: "4" },
+      Turn { role: "user", text: "Bob: and 3 + 3?" }
+    ])
+  end
+
+  it("reads an AI, a model, a mode and a decision out of an answer") do
+    Assert.equal(SlickAI.Bot.chosenAI(bot, "AI: claude"), Just("claude"))
+    Assert.equal(SlickAI.Bot.chosenAI(bot, "AI: default"), Just("default"))
+    Assert.equal(SlickAI.Bot.chosenAI(bot, "AI: watson"), None)
+    Assert.equal(SlickAI.Bot.chosenModel("Model: anthropic/claude-opus-4-5"), Just("anthropic/claude-opus-4-5"))
+    Assert.equal(SlickAI.Bot.chosenMode("Mode: auto"), Just("auto"))
+    Assert.equal(SlickAI.Bot.decision("Permission for Bash: Allow").map { |made| (made.tool, made.allowed?) }, Just(("Bash", true)))
+  end
+
+  it("answers the AI it has chosen, and the usual one where nothing is chosen") do
+    let chose = Bot { ...bot, chosen: {"acme/channels/general/": "claude"} }
+    Assert.equal(SlickAI.Bot.answering(chose, "acme/channels/general/"), "claude")
+    Assert.equal(SlickAI.Bot.answering(bot, "acme/channels/general/"), "claude")
+  end
+end
+
+describe("SlickAI.Bot, looking at Slick") do
+  it("takes note on its first look, then answers what names it, in its thread") do
+    let recorder = Process.spawn(Recorder {})
+    let fresh = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity }
+    let old = Message { id: "m0", userId: "u2", author: "Bob", body: "morning" }
+
+    let primed = looked(fresh, recorder, script([told(old, 0)], []))
+    Assert.truthy(primed.primed?)
+    Assert.equal(recorder.listed().or([]).filter { |call| call.startsWith?("POST") }, [])
+
+    let answered = looked(primed, recorder, script([told(old, 0), told(ada, 0)], [told(ada, 0)]))
+    let posts = recorder.listed().or([]).filter { |call| call.startsWith?("POST") }
+    Assert.equal(posts.count, 3)
+    Assert.truthy(posts.first.or("").startsWith?("${STATUS} "))
+    Assert.truthy(posts.second.or("").startsWith?("${ASK} "))
+    Assert.equal(posts.last.or(""), "${POST} {\"body\":\"It is 4.\",\"thread\":\"m1\"}")
+  end
+
+  it("answers what the stream tells it happened, and nothing else") do
+    let recorder = Process.spawn(Recorder {})
+    let primed = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity, primed?: true }
+
+    let happening = Happening { kind: "message", organization: "acme", place: "channels/general", thread: "", message: "m1", at: 1, cursor: 7 }
+    let spoken = lookedAt(primed, recorder, happening, script([told(ada, 0)], [told(ada, 0)]))
+    let posts = recorder.listed().or([]).filter { |call| call.startsWith?("POST") }
+    Assert.equal(posts.count, 3)
+    Assert.equal(posts.last.or(""), "${POST} {\"body\":\"It is 4.\",\"thread\":\"m1\"}")
+    Assert.equal(spoken.seen.get("m1"), Just(0))
+  end
+
+  it("says nothing when the AI answers that there is nothing to add") do
+    let recorder = Process.spawn(Recorder {})
+    let primed = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity, primed?: true }
+
+    let happening = Happening { kind: "message", organization: "acme", place: "channels/general", thread: "", message: "m1", at: 1, cursor: 7 }
+    let quiet = "{\"content\":[{\"type\":\"text\",\"text\":\"no reply\"}],\"stop_reason\":\"end_turn\"}"
+    lookedAt(primed, recorder, happening, script([told(ada, 0)], [told(ada, 0)]).put(ASK, quiet))
+    let posts = recorder.listed().or([]).filter { |call| call.startsWith?("${POST} ") }
+    Assert.equal(posts, [])
+  end
+
+  it("takes nothing typed for a permission, and a decision from an operator only") do
+    let recorder = Process.spawn(Recorder {})
+    let stranger = Message { id: "m4", userId: "u2", author: "Bob", body: "Permission for Bash: Allow", thread: "m1" }
+    let primed = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity, primed?: true, operators: ["u1"] }
+    looked(primed, recorder, script([told(ada, 3)], [told(ada, 3), told(four, 0), told(stranger, 0)]))
+    let posts = recorder.listed().or([]).filter { |call| call.startsWith?("${POST} ") }
+    Assert.falsy(posts.any? { |call| call.contains?("allowed you to use") })
+  end
+end
+
+# One thing the stream told, looked at over a scripted network; the bot
+# afterwards.
+foul lookedAt(bot: Bot, recorder: Server<Recorder>, happening: Happening, answers: {String: String}) -> Bot do
+  with SlickAI.Wire = Scripted { recorder: recorder, answers: answers } do
+    return SlickAI.Bot.told(bot, happening)
+  end
+end

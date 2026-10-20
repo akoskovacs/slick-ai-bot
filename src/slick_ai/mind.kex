@@ -1,0 +1,194 @@
+# SlickAI.Mind — which AI the bot asks, in one shape whatever it is.
+#
+#   Muse(Local { … })        the Muse installed on this machine
+#   OpenCode(Local { … })    the OpenCode installed on this machine
+#   Code(Local { … })        the Claude Code installed on this machine
+#   Api(Settings { … })      Claude over Anthropic's Messages API, with a key
+#
+# Each is asked the same way (`answered`), keeps a conversation the same way
+# (a session, or none), and reports the tools it was refused the same way
+# (`Answer.wanted`). What differs — which flags the program is run with, or
+# what the API is sent — is each provider's own module.
+#
+# One bot may hold several of them at once (`SlickAI.Bot`), and a
+# conversation chooses which answers it (`/model`); a session is kept per
+# conversation and per provider, so switching does not carry one provider's
+# work into another's.
+module SlickAI.Mind
+
+using SlickAI.Muse, only: [Local]
+using SlickAI.OpenCode, only: [Local]
+using SlickAI.Claude, only: [Local, Settings]
+
+type Mind = Muse(SlickAI.Muse.Local) | OpenCode(SlickAI.OpenCode.Local) | Code(SlickAI.Claude.Local) | Api(SlickAI.Claude.Settings)
+
+# One thing said: by the "user", or by the "assistant".
+record Turn do
+  role : String
+  text : String
+end
+
+# A tool the AI needs and may be allowed: its name, and what it wants to do
+# with it.
+record Want do
+  tool : String
+  detail : String = ""
+end
+
+# What is asked: the newest thing said, in a session when there is one,
+# with this model, with these tools allowed, and — for an AI that asks
+# before it uses one — with these asked about when they are refused.
+record Ask do
+  prompt : String
+  session : String = ""
+  # The model, as the provider takes it: "" is the provider's own choice.
+  model : String = ""
+  allowed : [String] = []
+  askable : [String] = []
+  # How tools are let through, as Claude Code takes it: "manual" asks for
+  # each, "auto" lets it judge, "plan" only plans. "" leaves it to the
+  # provider, which is manual.
+  mode : String = ""
+end
+
+# What came back: the words, the session they were said in ("" for one that
+# keeps none), and the tools it was refused on the way.
+record Answer do
+  text : String
+  session : String = ""
+  wanted : [Want] = []
+end
+
+# What the AI is told about its tools: which there are, and how a refusal
+# is put to the people. Each AI has its own way of needing a tool.
+told : Mind -> [String]
+let told(Muse(local)) do
+  return ["You have no tools. Answer in words."] if local.tools.empty?
+
+  let known : {String: String} = {
+    "Bash": "Bash (run a shell command)",
+    "Write": "Write (write a file)",
+    "Web": "Web (use the web)"
+  }
+  let described = local.tools.flatMap { |tool| known.get(tool).map { |shown| [shown] }.or([]) }.join(", ")
+  [
+    "Some things need a person's permission: ${described}. When you need",
+    "one of them, say in a sentence what you were about to do, and put on",
+    "a line of its own: NEED TOOL <name>: <what you want to do with it>.",
+    "Reading files needs no permission. Never start any other line with",
+    "NEED TOOL."
+  ]
+end
+let told(OpenCode(local)) do
+  return ["You have no tools. Answer in words."] if local.tools.empty?
+
+  let known : {String: String} = {
+    "Bash": "Bash (run a shell command)",
+    "Write": "Write (write a file)",
+    "Web": "Web (use the web)"
+  }
+  let described = local.tools.flatMap { |tool| known.get(tool).map { |shown| [shown] }.or([]) }.join(", ")
+  [
+    "Some things need a person's permission: ${described}. When you need",
+    "one of them, just try to use it: when it needs permission you are",
+    "refused, and the people are asked for you. Then say in a sentence",
+    "what you were about to do, and carry on when you are told you may.",
+    "Reading files needs no permission."
+  ]
+end
+let told(Code(_)) do
+  [
+    "If you have tools, some need a person's permission. When one is",
+    "refused, do not ask for permission yourself and do not look for a way",
+    "round it: say in a sentence what you were about to do. The people are",
+    "asked for you, and you are told what they decided."
+  ]
+end
+let told(Api(_)) = ["You have no tools. Answer in words."]
+
+# Whether this AI can be given tools at all. The Anthropic API cannot: it
+# only answers in words.
+tooled? : Mind -> Bool
+let tooled?(Muse(local)) = !local.tools.empty?
+let tooled?(OpenCode(local)) = !local.tools.empty?
+let tooled?(Code(local)) = !local.tools.empty?
+let tooled?(Api(_)) = false
+
+# The tools the bot may allow an operator to let through, by name — Bash,
+# Write and Web. Claude Code names its own tools as it refuses them, so for
+# it there is no list: whatever it asks about may be allowed (`gated?`).
+offered : Mind -> [String]
+let offered(Muse(local)) = local.tools
+let offered(OpenCode(local)) = local.tools
+let offered(Code(_)) = []
+let offered(Api(_)) = []
+
+# Whether a tool may be allowed only when `offered` names it.
+gated? : Mind -> Bool
+let gated?(Muse(_)) = true
+let gated?(OpenCode(_)) = true
+let gated?(Code(_)) = false
+let gated?(Api(_)) = false
+
+# Continues a conversation: `turns` is the whole of it, for a mind that
+# keeps nothing; `ask` is what the others are asked.
+answered : Mind -> String -> [Turn] -> Ask -> Result<Answer, String>
+foul answered(Muse(local), system, _, ask) = SlickAI.Muse.answered(local, system, ask)
+foul answered(OpenCode(local), system, _, ask) do
+  # Reading files needs no permission, so it is allowed whenever the run is
+  # a tooled one.
+  let reading = local.tools.empty? then ask.allowed else ask.allowed + ["Read"]
+  return SlickAI.OpenCode.answered(local, system, Ask { ...ask, allowed: reading })
+end
+foul answered(Code(local), system, _, ask) = SlickAI.Claude.answered(local, system, ask)
+foul answered(Api(settings), system, turns, _) = SlickAI.Claude.asked(settings, system, turns)
+
+# A new session for a conversation to go on in: "" for a mind that opens
+# none itself — the first answer names it (`Answer.session`) — and always ""
+# for one that keeps none.
+begins : Mind -> String
+foul begins(mind) do
+  match mind do
+    Muse(local) => return local.tools.empty? then "" else SlickAI.Muse.session()
+    _ => return ""
+  end
+end
+
+# The models this mind may be told to answer with, when it can say. Muse
+# and Claude are asked by name instead: whatever their own command takes.
+catalog : Mind -> Result<[String], String>
+foul catalog(mind) do
+  match mind do
+    OpenCode(local) => return SlickAI.OpenCode.catalog(local)
+    Muse(local) => return local.model.empty? then Error("Muse names no models; set MUSE_MODEL") else Ok([local.model])
+    Code(local) => return local.model.empty? then Error("Claude names no models; set CLAUDE_MODEL") else Ok([local.model])
+    Api(settings) => return Ok([settings.model])
+  end
+end
+
+# A conversation as the one prompt a mind that keeps no session takes: what
+# a single message says, or the conversation written out, the bot's own
+# turns marked as its own.
+transcript : [Turn] -> String
+let transcript(turns) do
+  return turns.first.map { |only| only.text }.or("") if turns.count <= 1
+
+  let lines = turns.map { |turn| turn.role == "assistant" then "You: ${turn.text}" else turn.text }
+  "The conversation so far, oldest first:\n\n${lines.join("\n\n")}\n\nAnswer the newest message."
+end
+
+# Which AI it is, in words.
+named : Mind -> String
+let named(Muse(local)) do
+  let which = local.model.empty? then "the local ${local.command}" else "the local ${local.command} (${local.model})"
+  local.tools.empty? then "${which}, without tools" else "${which}, with tools (${local.tools}) in ${local.directory}"
+end
+let named(OpenCode(local)) do
+  let which = local.model.empty? then "the local ${local.command}" else "the local ${local.command} (${local.model})"
+  local.tools.empty? then "${which}, without tools" else "${which}, with tools (${local.tools}) in ${local.directory}"
+end
+let named(Code(local)) do
+  let which = local.model.empty? then "the local ${local.command}" else "the local ${local.command} (${local.model})"
+  local.tools.empty? then "${which}, without tools" else "${which}, with tools (${local.tools}) in ${local.directory}"
+end
+let named(Api(settings)) = "Anthropic's API (${settings.model})"

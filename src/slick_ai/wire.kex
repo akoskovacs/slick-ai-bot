@@ -1,0 +1,37 @@
+# SlickAI.Wire — the one way out to the network.
+#
+# Slick's API is JSON over HTTP, and it is reached through here; so is
+# Anthropic's. A spec replaces them:
+#
+#   with SlickAI.Wire = Scripted { … } do … end
+using Net.HTTP
+using Net.HTTP.WebSocket, only: [WebSocket]
+
+capability SlickAI.Wire do
+  # Sends one request, `body` as its JSON ("" for none). The status and the
+  # response's text — whatever the status: a 404 is an answer, not a failure.
+  foul send(
+    method: String,
+    url: String,
+    headers: [(String, String)],
+    body: String
+  ) -> Result<(Integer, String), String> do
+    let all = body.empty? then headers else headers + [("Content-Type", "application/json")]
+    match Headers.from(all) do
+      Error(reason) => return Error("${reason.message}")
+      Ok(prepared) => match HTTP.request(method, url, prepared, body.to(Binary).or(Binary.empty)) do
+        Error(reason) => return Error("${reason.message}")
+        Ok(response) => return Ok((response.status.code, response.body.to(String).or("")))
+      end
+    end
+  end
+
+  # Opens the stream of what happens: Slick's /api/events WebSocket. The
+  # token travels in the address, the one way a WebSocket client has.
+  foul open(url: String) -> Result<Net.HTTP.WebSocket.Connection, String> do
+    match WebSocket.connect(url) do
+      Error(reason) => return Error("${reason}")
+      Ok(connection) => return Ok(connection)
+    end
+  end
+end

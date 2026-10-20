@@ -1,0 +1,174 @@
+# SlickAI.Claude — the two Claudes the bot may ask.
+#
+#   Code(Local { … })   the Claude Code installed on this machine
+#   Api(Settings { … }) Anthropic's Messages API, with a key
+#
+# The local one runs Claude Code's `claude -p`, so it answers as whoever is
+# signed in to Claude Code on this machine. Claude Code is an agent with a
+# shell and the files of this machine at hand, and whoever can write in
+# Slick decides what it is asked. So:
+#
+#   - With `tools` empty it is run with every tool taken away
+#     (`--tools ""`) and keeps no session: it can only answer in words.
+#   - With tools, it is run in `directory`, with none of this machine's own
+#     Claude Code settings (`--setting-sources ""`), so nothing is allowed
+#     that was not allowed here. A tool that needs permission is refused
+#     unless `Ask.allowed` names it, and the answer says what was refused
+#     (`Mind.Answer.wanted`) — which is what the bot asks an operator about.
+#
+# With tools a conversation is a Claude Code session, so that what a tool
+# found is still known on the next turn: the first answer says which
+# (`Answer.session`), and the next `Ask` names it.
+module SlickAI.Claude
+
+using JSON
+using SlickAI.Mind, only: [Turn, Ask, Answer, Want]
+
+# One question to the Claude Code that is installed here.
+record Local do
+  # The program: `claude` wherever PATH finds it, unless told otherwise.
+  command : String = "claude"
+  # The model, as `claude --model` takes it; "" is Claude Code's own choice.
+  model : String = ""
+  # How long an answer may take.
+  seconds : Integer = 120
+  # The tools it is given, as `claude --tools` takes them: "" for none,
+  # "default" for all of Claude Code's, or names ("Bash,Read,WebSearch").
+  tools : String = ""
+  # Where it runs when it has tools: what it can read without asking.
+  directory : String = ""
+end
+
+# One question to Anthropic's Messages API. A conversation is turns, oldest
+# first, the first of them the user's; there are no tools and no session.
+record Settings do
+  key : String
+  model : String = MODEL
+  # The longest answer, in tokens.
+  maxTokens : Integer = 1024
+  # Where the API is: another address is for a proxy, or for a spec.
+  base : String = "https://api.anthropic.com"
+end
+
+# The newest and most capable model, unless another is asked for.
+let MODEL = "claude-opus-5-5"
+
+# The arguments `claude` is run with.
+arguments : Local -> String -> Ask -> [String]
+let arguments(local, system, ask) do
+  let model = !ask.model.empty? then ["--model", ask.model] else (local.model.empty? then [] else ["--model", local.model])
+  let session = ask.session.empty? then [] else ["--resume", ask.session]
+  let allowed = ask.allowed.empty? then [] else ["--allowedTools", ask.allowed.join(",")]
+  let mode = !ask.mode.empty? && !local.tools.empty? then ["--permission-mode", ask.mode] else []
+  let kept = local.tools.empty? then ["--no-session-persistence"] else []
+  [
+    "-p",
+    "--tools", local.tools,
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--setting-sources", "",
+    "--output-format", "json",
+    "--system-prompt", system
+  ] + kept + model + mode + session + allowed + ["--", ask.prompt]
+end
+
+# What Claude Code said, from what `claude -p --output-format json` printed.
+said : Integer -> String -> Result<Answer, String>
+let said(exitCode, printed) do
+  match JSON.parse(printed.trim) do
+    Error(_) => Error("claude exited ${exitCode} without an answer")
+    Ok(value) => do
+      let fields : {String: Any} = value
+      let words = "${fields.get("result").or("")}".trim
+      return Error("claude could not answer: ${words}") if exitCode != 0 || fields.get("is_error").or(false) == true
+
+      let refused : [Any] = fields.get("permission_denials").or([])
+      let wanted = refused.map { |each| want(each) }
+      return Error("claude answered with no text") if words.empty? && wanted.empty?
+
+      Ok(Answer { text: words, session: "${fields.get("session_id").or("")}", wanted: wanted })
+    end
+  end
+end
+
+# Asks the local Claude Code.
+answered : Local -> String -> Ask -> Result<Answer, String>
+foul answered(local, system, ask) do
+  let run = arguments(local, system, ask)
+  let placed = ["-c", THERE, "sh", local.directory, local.command] + run
+  let program = local.directory.empty? then local.command else "sh"
+  match SlickAI.Shell.run(program, local.directory.empty? then run else placed, local.seconds) do
+    Ok((exitCode, printed)) => return said(exitCode, printed)
+    Error(reason) => return Error("${local.command} could not be run: ${reason}")
+  end
+end
+
+# The request a conversation is sent to the API as.
+request : Settings -> String -> [Turn] -> String
+let request(settings, system, turns) do
+  let messages : [Any] = turns.map { |turn| {"role": turn.role, "content": turn.text} }
+  let body : {String: Any} = {
+    "model": settings.model,
+    "max_tokens": settings.maxTokens,
+    "system": system,
+    "messages": messages
+  }
+  JSON.stringify(body)
+end
+
+# What Claude said in a response: its text blocks, joined. An `Error` when
+# the response is the API's own account of a failure.
+apiSaid : Integer -> String -> Result<Answer, String>
+let apiSaid(status, answer) do
+  match JSON.parse(answer) do
+    Error(_) => Error("Anthropic answered ${status} with something that is not JSON")
+    Ok(value) => do
+      let fields : {String: Any} = value
+      return Error(failure(status, fields)) if status < 200 || status > 299
+
+      let content : [Any] = fields.get("content").or([])
+      let texts = content.flatMap { |each|
+        let block : {String: Any} = each
+        block.get("type").or("") == "text" then ["${block.get("text").or("")}"] else []
+      }
+      texts.empty? then Error("Claude answered with no text") else Ok(Answer { text: texts.join("\n").trim })
+    end
+  end
+end
+
+# Asks the API to continue a conversation.
+asked : Settings -> String -> [Turn] -> Result<Answer, String>
+foul asked(settings, system, turns) do
+  let headers = [("x-api-key", settings.key), ("anthropic-version", "2023-06-01")]
+  match SlickAI.Wire.send("POST", "${settings.base}/v1/messages", headers, request(settings, system, turns)) do
+    Ok((status, answer)) => return apiSaid(status, answer)
+    Error(reason) => return Error("Claude could not be reached, or took too long to answer (${reason})")
+  end
+end
+
+private do
+  # Runs a program in a directory, made if it is not there, with nothing to
+  # read from: `sh -c THERE sh <directory> <program> <arguments…>`.
+  let THERE = "mkdir -p \"$1\" && cd \"$1\" && shift && exec \"$@\" </dev/null"
+
+  # A refused tool as the API of `claude` tells it: `tool_name`, and a
+  # `tool_input` whose telling part depends on the tool.
+  want : Any -> Want
+  let want(given) do
+    let fields : {String: Any} = given
+    let none : {String: Any} = {}
+    let input : {String: Any} = fields.get("tool_input").or(none)
+    let telling = ["command", "file_path", "url", "query", "pattern", "path"]
+      .flatMap { |name| input.get(name).map { |found| ["${found}"] }.or([]) }
+    Want { tool: "${fields.get("tool_name").or("")}", detail: telling.first.or(JSON.stringify(input)).take(600) }
+  end
+
+  # Why a request failed, in the API's words when it gave any.
+  failure : Integer -> {String: Any} -> String
+  let failure(status, fields) do
+    let none : {String: Any} = {}
+    let detail : {String: Any} = fields.get("error").or(none)
+    let words = "${detail.get("message").or("")}"
+    words.empty? then "Anthropic answered ${status}" else "Anthropic answered ${status}: ${words}"
+  end
+end

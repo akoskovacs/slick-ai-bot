@@ -1,0 +1,244 @@
+# SlickAI.OpenCode — one question to the OpenCode that is installed here.
+#
+#   SlickAI.Mind.answered(OpenCode(Local {}), "You are…", turns, Ask { prompt: "Hello" })
+#
+# It runs OpenCode's `opencode run`, so it answers as whoever is signed in
+# to OpenCode on this machine: no API key, and nothing to pay per request
+# beyond what that account already is.
+#
+# OpenCode on its own allows its tools unless told otherwise. Whoever can
+# write in Slick decides what it is asked, so the bot gates its tools
+# itself instead, with the project's own `opencode.json`, written for each
+# run (`SlickAI.Files`): what is allowed, what is asked about, and nothing
+# else.
+#
+#   - With `allowed` empty every tool is denied and it keeps no session:
+#     it can only answer in words.
+#   - With tools allowed, a conversation is an OpenCode session: the first
+#     answer says which (`Mind.Answer.session`), and the next `Ask` names
+#     it. What it is allowed is named per tool — Bash, Write or Web — and
+#     anything else stays denied. Reading files needs no permission.
+#
+# A tool that is asked about is refused without asking anybody — there is
+# nobody to ask — and the answer says what was refused (`Answer.wanted`),
+# which is what the bot asks an operator about.
+module SlickAI.OpenCode
+
+using JSON
+using SlickAI.Mind, only: [Ask, Answer, Want]
+
+record Local do
+  # The program: `opencode` wherever PATH finds it, unless told otherwise.
+  command : String = "opencode"
+  # The model, as `opencode run --model` takes it — `provider/model`;
+  # "" is OpenCode's own choice.
+  model : String = ""
+  # How hard it thinks, as `opencode run --variant` takes it; "" leaves
+  # it to the model.
+  variant : String = ""
+  # How long an answer may take.
+  seconds : Integer = 120
+  # The tools it may be allowed, by name: "Bash" (the shell), "Write"
+  # (writing files) and "Web" (the web). Reading files needs no
+  # permission, and so is never among them.
+  tools : [String] = []
+  # Where it runs: what it can read without asking, and where the
+  # permissions it runs with are written.
+  directory : String = "work"
+end
+
+# The tools there are, by name.
+let KNOWN = ["Bash", "Write", "Web"]
+
+# The arguments `opencode` is run with: one headless `run`, its events as
+# JSON, without external plugins, in the conversation's session when there
+# is one, and the prompt last.
+arguments : Local -> String -> Ask -> [String]
+let arguments(local, system, ask) do
+  let model = !ask.model.empty? then ["--model", ask.model] else (local.model.empty? then [] else ["--model", local.model])
+  let variant = local.variant.empty? then [] else ["--variant", local.variant]
+  let session = ask.session.empty? then [] else ["--session", ask.session]
+  ["run", "--format", "json", "--pure", "--dir", local.directory] + variant + model + session + ["${system}\n\n${ask.prompt}"]
+end
+
+# The permissions a run is given, as the project's own `opencode.json`:
+# what is allowed, what is asked about, and nothing else — anything not
+# named is denied.
+config : Ask -> String
+let config(ask) do
+  let rules : {String: Any} = {
+    "*": "deny",
+    "read": reading(ask.allowed),
+    "glob": reading(ask.allowed),
+    "grep": reading(ask.allowed),
+    "list": reading(ask.allowed),
+    "bash": ruling(ask, "Bash"),
+    "edit": ruling(ask, "Write"),
+    "webfetch": ruling(ask, "Web"),
+    "websearch": ruling(ask, "Web")
+  }
+  JSON.stringify({"permission": rules})
+end
+
+# What OpenCode said, from what `opencode run --format json` printed: one
+# JSON event per line — the text said, the session said in, and the tools
+# refused on the way. An `Error` when a line is not JSON, when the run
+# failed, or when nothing was said and nothing was refused.
+said : Integer -> String -> Result<Answer, String>
+let said(exitCode, printed) do
+  let lines = printed.split("\n").reject { |line| line.trim.empty? }
+  let events = lines.flatMap { |line| kept(line) }
+  let bad = lines.reject { |line| kept(line).count == 1 }.first.or("").take(80)
+  return Error("opencode printed something that is not JSON: ${bad}") if events.count != lines.count
+
+  let failures = events.flatMap { |event| failed(event) }
+  return Error(failures.first.or("opencode failed")) if !failures.empty?
+  return Error("opencode exited ${exitCode} without an answer") if exitCode != 0
+
+  let texts = events.flatMap { |event| spoken(event) }
+  let wanted = events.flatMap { |event| refused(event) }
+  return Error("opencode answered with no text") if texts.empty? && wanted.empty?
+
+  Ok(Answer { text: texts.join("\n\n").trim, session: meetings(events), wanted: wanted })
+end
+
+# Asks the local OpenCode. The permissions go down first: when they cannot
+# be written the run must not happen, since what is there would be somebody
+# else's.
+answered : Local -> String -> Ask -> Result<Answer, String>
+foul answered(local, system, ask) do
+  return Error("opencode.json could not be written in ${local.directory}") if !SlickAI.Files.place(local.directory, config(ask))
+
+  let run = ["-c", THERE, "sh", local.command] + arguments(local, system, ask)
+  match SlickAI.Shell.run("sh", run, local.seconds) do
+    Ok((exitCode, printed)) => return said(exitCode, printed)
+    Error(reason) => return Error("${local.command} could not be run: ${reason}")
+  end
+end
+
+# The models the local OpenCode offers, as `provider/model`, in the order
+# `opencode models` lists them.
+catalog : Local -> Result<[String], String>
+foul catalog(local) do
+  let run = ["-c", THERE, "sh", local.command, "models"]
+  match SlickAI.Shell.run("sh", run, 60) do
+    Ok((0, printed)) => return Ok(printed.split("\n").map { |line| line.trim }.filter { |line| named?(line) })
+    Ok((code, _)) => return Error("${local.command} models stopped with ${code}")
+    Error(reason) => return Error("${local.command} could not be run: ${reason}")
+  end
+end
+
+# Whether a line is a model as `opencode models` lists one: `provider/model`.
+named? : String -> Bool
+let named?(line) = line.contains?("/") && !line.contains?(" ") && !line.startsWith?("/")
+
+private do
+  # Runs a program with nothing to read from: `sh -c THERE sh <program>
+  # <arguments…>`. OpenCode reads its stdin, so without this it waits for
+  # input that never comes instead of answering.
+  let THERE = "exec \"$@\" </dev/null"
+
+  # Whether reading files is allowed: it needs no permission, so it is
+  # whenever the run was asked with it.
+  reading : [String] -> String
+  let reading(allowed) = allowed.contains?("Read") then "allow" else "deny"
+
+  # Whether a tool is allowed, asked about, or denied: allowed when it is
+  # among this run's, asked about when it may yet be allowed, and denied
+  # otherwise.
+  ruling : Ask -> String -> String
+  let ruling(ask, tool) do
+    return "allow" if ask.allowed.contains?(tool)
+    return "ask" if ask.askable.contains?(tool)
+    return "deny"
+  end
+
+  # One printed line as the event it is: nothing when it is not JSON.
+  kept : String -> [Any]
+  let kept(line) do
+    match JSON.parse(line) do
+      Ok(event) => return [event]
+      Error(_) => return []
+    end
+  end
+
+  # Why a run failed, when the event says it did.
+  failed : Any -> [String]
+  let failed(value) do
+    let event : {String: Any} = value
+    return [] if "${event.get("type").or("")}" != "error"
+
+    let none : {String: Any} = {}
+    let detail : {String: Any} = event.get("error").flatMap { |each|
+      let found : {String: Any} = each
+      found.get("data")
+    }.or(none)
+    let words = "${detail.get("message").or("")}"
+    let status = "${detail.get("statusCode").or("")}"
+    return ["opencode failed"] if words.empty?
+
+    [status.empty? then words else "${words} (${status})"]
+  end
+
+  # What an event says, when it says anything.
+  spoken : Any -> [String]
+  let spoken(value) do
+    let event : {String: Any} = value
+    return [] if "${event.get("type").or("")}" != "text"
+
+    let none : {String: Any} = {}
+    let part : {String: Any} = event.get("part").or(none)
+    let words = "${part.get("text").or("")}".trim
+    words.empty? then [] else [words]
+  end
+
+  # The session the events were said in: the first one any of them names.
+  meetings : [Any] -> String
+  let meetings(events) do
+    events.flatMap { |value|
+      let event : {String: Any} = value
+      let named = "${event.get("sessionID").or("")}"
+      named.empty? then [] else [named]
+    }.first.or("")
+  end
+
+  # What an event refused, when it is a tool refused for want of
+  # permission. A tool that ran and failed is not refused: it says so
+  # itself, with what came back.
+  refused : Any -> [Want]
+  let refused(value) do
+    let event : {String: Any} = value
+    return [] if "${event.get("type").or("")}" != "tool_use"
+
+    let none : {String: Any} = {}
+    let part : {String: Any} = event.get("part").or(none)
+    let state : {String: Any} = part.get("state").or(none)
+    let denied = "${state.get("error").or("")}"
+    return [] if "${state.get("status").or("")}" != "error" || !denied.contains?("rejected permission")
+
+    let tool = "${part.get("tool").or("")}"
+    let input : {String: Any} = state.get("input").or(none)
+    [Want { tool: grouped(tool), detail: telling(input) }]
+  end
+
+  # An OpenCode tool as the permission it answers to: the shell, writing
+  # files, the web, or reading — anything else under its own name, which
+  # is never on offer.
+  grouped : String -> String
+  let grouped(tool) do
+    return "Bash" if tool == "bash"
+    return "Write" if tool == "edit" || tool == "write"
+    return "Web" if tool == "webfetch" || tool == "websearch"
+    return "Read" if tool == "read" || tool == "glob" || tool == "grep" || tool == "list"
+    return tool
+  end
+
+  # What a refused tool wanted to do with it: the telling part of what it
+  # was called with, or the whole of it.
+  telling : {String: Any} -> String
+  let telling(input) do
+    let telling = ["command", "filePath", "file_path", "url", "query", "pattern", "path"]
+      .flatMap { |name| input.get(name).map { |found| ["${found}"] }.or([]) }
+    telling.first.or(JSON.stringify(input)).take(600)
+  end
+end

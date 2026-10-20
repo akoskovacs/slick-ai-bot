@@ -1,0 +1,269 @@
+# slick-ai-bot — an AI as a bot in Slick.
+#
+#   SLICK_TOKEN=slick_bot_… tey all
+#   MUSE_TOKEN=slick_bot_…    tey muse
+#   OPENCODE_TOKEN=…          tey opencode
+#   CLAUDE_TOKEN=…            tey claude
+#
+# One bot may hold several AIs (`tey all`), and a conversation chooses
+# which answers it with `/model`; one command starts a bot with a single
+# AI, as the bots this one replaces did. What happens in Slick is told to
+# the bot as it happens (Slick's /api/events); when it cannot be — an
+# older Slick, or a network in the way — the bot looks instead, every
+# SLICK_POLL_SECONDS, the way the old bots always did.
+#
+# An AI has no tools unless operators are named: the people whose answer
+# to "Permission for Bash: Allow | Deny" counts, and the only ones who may
+# choose the mode, the model, or hand a session over.
+#
+#   SLICK_URL             where Slick is; http://127.0.0.1:4000 unless set
+#   SLICK_TOKEN           the bot's token, from Slick's Bots dialog; or
+#                         MUSE_TOKEN, OPENCODE_TOKEN or CLAUDE_TOKEN for
+#                         the command of that name
+#   SLICK_OPERATORS       the Slick ids of the people who may allow a tool
+#                         and choose what a conversation asks; BOT_OPERATORS
+#                         reads the same; none unless set
+#   SLICK_POLL_SECONDS    how often Slick is looked at when it cannot tell
+#                         the bot what happens; every 2 seconds unless set
+#   PROVIDERS             with `tey all`, which AIs the bot offers, from
+#                         muse, opencode and claude; all of them unless set
+#
+# Muse:
+#   MUSE_COMMAND          the local Muse; `muse` unless set
+#   MUSE_MODEL            the model; Muse's own default unless set
+#   MUSE_EFFORT           how hard it thinks; Muse's own default unless set
+#   MUSE_SECONDS          how long it may take; 120 without tools, 300 with
+#   MUSE_TOOLS            which tools: Bash, Write and Web, all unless set
+#   MUSE_DIRECTORY        where it runs with tools, and so what it can read
+#                         without asking; ./work unless set
+#
+# OpenCode:
+#   OPENCODE_COMMAND      the local OpenCode; `opencode` unless set
+#   OPENCODE_MODEL        the model, as `provider/model`; OpenCode's own
+#                         choice unless set
+#   OPENCODE_VARIANT      how hard it thinks; the model's own choice unless
+#                         set
+#   OPENCODE_SECONDS      how long it may take; 120 without tools, 300 with
+#   OPENCODE_TOOLS        which tools: Bash, Write and Web, all unless set
+#   OPENCODE_DIRECTORY    where it runs; ./work unless set
+#
+# Claude:
+#   CLAUDE_COMMAND        the local Claude Code; `claude` unless set
+#   CLAUDE_MODEL          the model; each Claude's own default unless set
+#   CLAUDE_SECONDS        how long it may take; 120 without tools, 300 with
+#   CLAUDE_TOOLS          which tools, as `claude --tools` takes them; all
+#                         of Claude Code's ("default") unless set
+#   CLAUDE_DIRECTORY      where it runs with tools; ./work unless set
+#   ANTHROPIC_API_KEY     with `claude`, asks Anthropic's API instead of the
+#                         local Claude Code
+#   CLAUDE_MAX_TOKENS     the API's longest answer, in tokens; 1024 unless
+#                         set
+#   ANTHROPIC_BASE_URL    where the API is, for a proxy
+using SlickAI.Slick, only: [Slick, Told]
+using SlickAI.Muse, as: MuseProvider
+using SlickAI.OpenCode, as: OpenCodeProvider
+using SlickAI.Claude, as: ClaudeProvider
+using SlickAI.Mind, only: [Mind, Muse, OpenCode, Code, Api]
+using SlickAI.Bot, only: [Bot]
+using Net.HTTP.WebSocket, only: [Text, CloseMessage, Connection]
+
+foul failed(reason: String) -> Void do
+  IO.printError("slick-ai-bot: ${reason}")
+  System.exit(1)
+end
+
+# An environment variable that has to be set, or "" after saying so.
+foul required(name: String) -> String do
+  let value = ENV.get(name).or("").trim
+  if value.empty?
+    failed("${name} is not set")
+  end
+  return value
+end
+
+foul configured(name: String, otherwise: Integer) -> Integer do
+  return ENV.get(name).flatMap { |text| text.to(Integer) }.or(otherwise)
+end
+
+# An environment variable as the words it lists, separated by commas.
+foul listed(name: String) -> [String] do
+  return ENV.get(name).or("").split(",").map { |each| each.trim }.reject { |each| each.empty? }
+end
+
+# The people whose answer allows a tool, by their id in Slick.
+foul trusted() -> [String] do
+  let named = listed("SLICK_OPERATORS")
+  return named if !named.empty?
+  return listed("BOT_OPERATORS")
+end
+
+# The tools a provider may be allowed: all of them, unless some are named.
+foul offered(name: String, known: [String]) -> [String] do
+  let named = listed("${name}_TOOLS")
+  return known if named.empty?
+
+  named.filter { |tool| known.contains?(tool) }
+end
+
+foul muse(tooled: Bool) -> Mind do
+  return Muse(MuseProvider.Local {
+    command: ENV.get("MUSE_COMMAND").or("muse"),
+    model: ENV.get("MUSE_MODEL").or("").trim,
+    effort: ENV.get("MUSE_EFFORT").or("").trim,
+    seconds: configured("MUSE_SECONDS", tooled then 300 else 120),
+    tools: tooled then offered("MUSE", MuseProvider.KNOWN) else [],
+    directory: tooled then ENV.get("MUSE_DIRECTORY").or("work") else ""
+  })
+end
+
+foul opencode(tooled: Bool) -> Mind do
+  return OpenCode(OpenCodeProvider.Local {
+    command: ENV.get("OPENCODE_COMMAND").or("opencode"),
+    model: ENV.get("OPENCODE_MODEL").or("").trim,
+    variant: ENV.get("OPENCODE_VARIANT").or("").trim,
+    seconds: configured("OPENCODE_SECONDS", tooled then 300 else 120),
+    tools: tooled then offered("OPENCODE", OpenCodeProvider.KNOWN) else [],
+    directory: ENV.get("OPENCODE_DIRECTORY").or("work")
+  })
+end
+
+# The Claude to ask: the API when there is a key for it, and otherwise the
+# one installed here.
+foul claude(tooled: Bool) -> Mind do
+  let key = ENV.get("ANTHROPIC_API_KEY").or("").trim
+  let model = ENV.get("CLAUDE_MODEL").or("").trim
+  if key.empty?
+    return Code(ClaudeProvider.Local {
+      command: ENV.get("CLAUDE_COMMAND").or("claude"),
+      model: model,
+      seconds: configured("CLAUDE_SECONDS", tooled then 300 else 120),
+      tools: tooled then ENV.get("CLAUDE_TOOLS").or("default") else "",
+      directory: tooled then ENV.get("CLAUDE_DIRECTORY").or("work") else ""
+    })
+  end
+  return Api(ClaudeProvider.Settings {
+    key: key,
+    model: model.empty? then ClaudeProvider.MODEL else model,
+    maxTokens: configured("CLAUDE_MAX_TOKENS", 1024),
+    base: ENV.get("ANTHROPIC_BASE_URL").or("https://api.anthropic.com")
+  })
+end
+
+# The AIs one bot holds, by name, and which of them answers where nothing
+# has been said otherwise: one, for the command of its name, or as many as
+# PROVIDERS says for `all`.
+foul chosen(command: String, tooled: Bool) -> ({String: Mind}, String) do
+  match command do
+    "muse" => return ({"muse": muse(tooled)}, "muse")
+    "opencode" => return ({"opencode": opencode(tooled)}, "opencode")
+    "claude" => return ({"claude": claude(tooled)}, "claude")
+    _ => do
+      let named = listed("PROVIDERS")
+      let wanted = named.empty? then ["muse", "opencode", "claude"] else named.map { |name| name.lowerCase }
+      let minds = wanted.reduce({}) { |found, name|
+        match name do
+          "muse" => found.put("muse", muse(tooled))
+          "opencode" => found.put("opencode", opencode(tooled))
+          "claude" => found.put("claude", claude(tooled))
+          _ => found
+        end
+      }
+      let usual = minds.has?("muse") then "muse" else minds.keys.first.or("")
+      return (minds, usual)
+    end
+  end
+end
+
+# The token of the bot: the one named for the AI the command asks, when it
+# is set, and otherwise SLICK_TOKEN.
+foul token(command: String) -> String do
+  let named : {String: String} = {
+    "muse": "MUSE_TOKEN",
+    "opencode": "OPENCODE_TOKEN",
+    "claude": "CLAUDE_TOKEN"
+  }
+  let own = ENV.get(named.get(command).or("SLICK_TOKEN")).or("").trim
+  return required(own.empty? then "SLICK_TOKEN" else named.get(command).or("SLICK_TOKEN"))
+end
+
+# What the stream told, acted on: the bot afterwards, and how far it has now
+# been told. `Again` is a full look, as a bot that could only look would
+# take now and then.
+foul heard(bot: Bot, said: Told) -> (Bot, Integer) do
+  match said do
+    Again(cursor) => return (SlickAI.Bot.polled(bot), cursor)
+    CaughtUp(cursor) => return (bot, cursor)
+    One(happening) => return (SlickAI.Bot.told(bot, happening), happening.cursor)
+  end
+end
+
+# The stream of what happens, until it goes; the bot afterwards, and how
+# far it has now been told.
+foul listening(bot: Bot, socket: Connection, cursor: Integer) -> (Bot, Integer) do
+  var current = bot
+  var far = cursor
+  var open? = true
+  loop do
+    break if !open?
+    match socket.receiveMessage(timeout: Just(30.seconds)) do
+      Ok(Text(words)) => match SlickAI.Slick.read(words) do
+        Ok(said) => do
+          let (after, told) = heard(current, said)
+          current = after
+          far = told
+        end
+        Error(reason) => IO.printError("slick-ai-bot: ${reason}")
+      end
+      Ok(CloseMessage(_, _)) => open? = false
+      Ok(_) => ()
+      Error(reason) => do
+        open? = false if reason.kind != Timeout
+      end
+    end
+  end
+  return (current, far)
+end
+
+main(args) do
+  let command = args.first.or("all")
+  let slick = Slick {
+    base: ENV.get("SLICK_URL").or("http://127.0.0.1:4000"),
+    token: token(command)
+  }
+  let operators = trusted()
+  let (minds, usual) = chosen(command, !operators.empty?)
+  let pause = configured("SLICK_POLL_SECONDS", 2)
+  match SlickAI.Slick.me(slick) do
+    Error(reason) => failed(reason)
+    Ok(identity) => do
+      let names = minds.entries.reduce([]) { |lines, entry|
+        match entry do
+          (name, mind) => lines + ["${name} (${SlickAI.Mind.named(mind)})"]
+        end
+      }.join("; ")
+      IO.printLine("slick-ai-bot: in Slick as @${identity.name}, asking ${names}")
+      match SlickAI.Slick.announced(slick, SlickAI.Bot.COMMANDS) do
+        Ok(_) => ()
+        Error(reason) => IO.printError("slick-ai-bot: could not tell Slick its commands: ${reason}")
+      end
+      var bot = Bot { slick: slick, minds: minds, usual: usual, identity: identity, operators: operators }
+      var cursor = 0
+      loop do
+        match SlickAI.Wire.open(SlickAI.Slick.stream(slick, cursor)) do
+          Ok(socket) => do
+            let (after, far) = listening(bot, socket, cursor)
+            bot = after
+            cursor = far
+          end
+          Error(reason) => do
+            # A Slick that cannot tell the bot what happens is looked at
+            # instead, the way the old bots always did.
+            IO.printError("slick-ai-bot: ${reason}")
+            bot = SlickAI.Bot.polled(bot)
+            Task.sleep(pause.seconds)
+          end
+        end
+      end
+    end
+  end
+end

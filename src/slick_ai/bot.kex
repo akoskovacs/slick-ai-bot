@@ -1,0 +1,913 @@
+# SlickAI.Bot — what the bot does with what it reads and what it is told.
+#
+# In a channel the bot is asked by name: a message that says `@slick` (its
+# own name in Slick, whatever that is) is answered in that message's
+# thread. The thread is then a conversation — every reply a person makes
+# there is answered too, with the whole thread as what has been said so far.
+#
+# In a private chat nobody has to name it: whatever a person writes there is
+# for the bot, and it answers in the chat itself, with the chat's newest
+# messages as the conversation.
+#
+# What Slick tells it happens, happens: each telling off the stream
+# (`SlickAI.Slick.stream`) is one place to look — a message, a form
+# answered, a command used — and the bot looks there and nowhere else
+# (`told`). When it has to start again — first coming up, or more having
+# happened than Slick remembers — one full look takes note of everything
+# (`polled`), the way a bot that could only look worked.
+#
+# Which AI answers is chosen per conversation: the usual one (`usual`), or
+# another an operator names with `/model`, together with a model. Each keeps
+# its own session for the conversation, so switching does not carry one
+# AI's work into another's. An operator can also hand a session over — one
+# begun at the command line — with `/adopt`, and the conversation goes on
+# from where it left off.
+#
+# An AI with tools asks before it uses one. What it was refused comes back
+# with its answer, and the bot puts the question in the conversation as a
+# form — "Permission for Bash: Allow | Deny". An answer to a form is not a
+# message: Slick keeps it with the message that asked, and tells the bot
+# the answers to its own forms only (`Slick.Slick.answers`). So nothing
+# typed is a permission, and neither is the answer to a form somebody else
+# posted that looks like the bot's. An answer counts when an operator gave
+# it and the bot was waiting for it; what it allows holds for that
+# conversation, for the turns an operator asks for.
+#
+# An operator also chooses how tools are let through in a conversation, by
+# writing `/mode`: the bot answers with a form — manual, auto or plan.
+module SlickAI.Bot
+
+using SlickAI.Slick, only: [Slick, Identity, Message, Given, Happening]
+using SlickAI.Mind, only: [Mind, Turn, Ask, Want]
+
+# The longest thing said in one message: Slick takes 4000 characters.
+let LONGEST = 3800
+
+# How much of a private chat is the conversation: its newest messages.
+let REMEMBERED = 30
+
+# What the bot says it is doing while the AI writes, and for how long that
+# is believed before it has to be said again.
+let THINKING = "Thinking"
+let THINKING_SECONDS = 120
+
+# How a permission question is labelled, and so how its answer starts.
+let PERMISSION = "Permission for "
+
+# What opens and closes code in a message.
+let FENCE = "```"
+
+# What an operator writes to choose how tools are let through, what the
+# question is labelled, and the ways there are — the first is the usual one.
+let MODE_ASKED = "/mode"
+let MODE = "Mode"
+let MODES = ["manual", "auto", "plan"]
+
+# What an operator writes to choose which AI answers and with which model,
+# what each question is labelled, and what answers both back to the usual.
+let MODEL_ASKED = "/model"
+let AI = "AI"
+let MODEL = "Model"
+let DEFAULT = "default"
+
+# What the AI answers when a message needs nothing from it: the bot then
+# says nothing at all.
+let SILENT = "no reply"
+
+# What an operator writes to hand a session over: one begun at the command
+# line, for the conversation to go on from.
+let ADOPT_ASKED = "/adopt"
+
+# The slash commands the bot answers to, as Slick's composer offers them.
+let COMMANDS = [
+  ("model", "Choose which AI answers here, and with which model (operators)"),
+  ("mode", "Choose how tools are let through here (operators)"),
+  ("adopt", "Hand a session begun at the command line to this conversation (operators)")
+]
+
+# How much of a message the models of one AI may take: Slick takes a message
+# of at most 4000 characters, and the question has words too.
+let MODELS_ROOM = 3600
+
+record Bot do
+  slick : Slick
+  # The AIs the bot may ask, by name: "muse", "opencode", "claude"…
+  minds : {String: Mind} = {}
+  # The one that answers where nothing has been said otherwise.
+  usual : String = ""
+  identity : Identity
+  # Messages seen so far, and how many replies each had then.
+  seen : {String: Integer} = {}
+  # Whether the first full look has been taken.
+  primed? : Bool = false
+  # The people whose word allows a tool, by their id in Slick.
+  operators : [String] = []
+  # The session each conversation is, with each AI that keeps one:
+  # "<organization>/<place>/<thread>|<ai>".
+  sessions : {String: String} = {}
+  # The tools an operator has allowed in each conversation.
+  granted : {String: [String]} = {}
+  # The tools it has asked about in each conversation and not been answered
+  # on: a decision counts only for one of these.
+  pending : {String: [String]} = {}
+  # How tools are let through in each conversation an operator has said so
+  # in: one of MODES.
+  modes : {String: String} = {}
+  # The AI each conversation has chosen: "" is the usual one.
+  chosen : {String: String} = {}
+  # The model each conversation has chosen: "" is the AI's own.
+  models : {String: String} = {}
+  # When the newest answer it has had to one of its forms was given.
+  answeredAt : Integer = 0
+  # When the newest slash command used for it was used.
+  invokedAt : Integer = 0
+end
+
+# What somebody decided about a tool: `Permission for Bash: Allow`.
+record Decision do
+  tool : String
+  allowed? : Bool
+end
+
+# Whether a message asks for the bot by name.
+mentions? : String -> String -> Bool
+let mentions?(name, body) = body.lowerCase.contains?("@${name.lowerCase}")
+
+# The AI that answers a conversation, by its name.
+foul answering(bot: Bot, key: String) -> String do
+  let chosen = bot.chosen.get(key).or("")
+  return chosen if bot.minds.has?(chosen)
+  return bot.usual if bot.minds.has?(bot.usual)
+  return bot.minds.keys.first.or("")
+end
+
+# The mind behind one of the bot's AIs, by name — the usual one when the
+# name is not one it has.
+foul minding(bot: Bot, ai: String) -> Mind do
+  match bot.minds.get(ai) do
+    Just(mind) => return mind
+    None => match bot.minds.get(bot.usual) do
+      Just(mind) => return mind
+      None => match bot.minds.values.first do
+        Just(mind) => return mind
+        None => return Muse(SlickAI.Muse.Local {})
+      end
+    end
+  end
+end
+
+# What the AI is told about where it is. `ai` is its name in the bot.
+foul briefing(bot: Bot, ai: String, organization: String) -> String do
+  let mind = minding(bot, ai)
+  let place = [
+    "You are ${titled(ai)}, taking part in a team chat called Slick as the bot",
+    "@${bot.identity.name}, in the organization \"${organization}\"."
+  ]
+  let reading = [
+    "You are reading one conversation. Each message from a person starts",
+    "with their name and a colon; your own earlier replies are given as",
+    "yours. Answer the newest message, and do not start your answer with",
+    "your name."
+  ]
+  let markup = [
+    "Slick shows a light markup, a line at a time: \"# \" starts a heading,",
+    "\"- \" a list item, \"> \" a quote, three backticks on a line of their",
+    "own open and close code, and \"---\" is a divider. Inside a line,",
+    "*bold*, _italic_, ~struck~ and `code` work, and addresses starting",
+    "with https:// become links. There are no tables, no numbered lists,",
+    "and no **double-star** bold."
+  ]
+  let asking = [
+    "To ask the people something, put a form in your message: a line",
+    "starting with \"[?] \". \"[?] Deploy to: staging | production\" shows",
+    "a button for each option, and \"[?] Notes\" a field to type in; lines",
+    "like these one under the other are one form with a Send button. The",
+    "answer comes back as a message from whoever gave it, such as",
+    "\"Deploy to: staging\". Use a form when a choice is what you need;",
+    "do not use one for a question that plain words ask as well."
+  ]
+  let manner = [
+    "Be brief, the way a helpful colleague is in chat. Stay under",
+    "${LONGEST} characters."
+  ]
+  let judging = [
+    "You are part of the conversation, not only answering when you are",
+    "named. When a message needs nothing from you, answer with exactly",
+    "\"${SILENT}\" and nothing else, and nothing of yours is said. Otherwise",
+    "answer it normally."
+  ]
+  [place, reading, markup, asking, SlickAI.Mind.told(mind), manner, judging].map { |lines| lines.join(" ") }.join("\n\n")
+end
+
+# An AI's name, as it is said in a sentence.
+titled : String -> String
+let titled(name) do
+  let known : {String: String} = {
+    "muse": "Muse",
+    "opencode": "OpenCode",
+    "claude": "Claude",
+    "claude-api": "Claude"
+  }
+  return known.get(name).or(name)
+end
+
+# What an answer decides about a tool, if it is the answer to a permission
+# question: `Permission for Bash: Allow`.
+decision : String -> Decision?
+let decision(body) do
+  let line = body.split("\n").find { |each| each.trim.startsWith?(PERMISSION) }.or("").trim
+  let parts = line.drop(PERMISSION.count).split(": ")
+  return None if line.empty? || parts.count != 2
+
+  Just(Decision { tool: parts.first.or("").trim, allowed?: parts.last.or("").trim == "Allow" })
+end
+
+# The question a refused tool is put to the people as.
+request : Want -> String
+let request(want) do
+  let shown = want.detail.replace(FENCE, "` ` `").trim
+  let what = shown.empty? then [] else [FENCE, shown, FENCE]
+  (["I need permission to use *${want.tool}*:"] + what + [
+    "Allowing it lets me use ${want.tool} for the rest of this conversation.",
+    "[?] ${PERMISSION}${want.tool}: Allow | Deny"
+  ]).join("\n")
+end
+
+# A thread as a conversation with the AI: the bot's own messages are the
+# assistant's turns, everyone else's are the user's, each under their
+# author's name. Turns of one side that follow each other are joined, since
+# a conversation has to change sides at every turn.
+conversation : String -> [Message] -> [Turn]
+let conversation(botId, messages) do
+  messages.reduce([]) { |turns, message| followed(turns, spoken(botId, message)) }
+end
+
+# Whether a thread is one the bot should speak in now: it was asked into it
+# — the first message names it, or it has spoken there before — and the
+# newest message is a person's.
+due? : Identity -> [Message] -> Bool
+let due?(identity, messages) do
+  let asked = messages.first.map { |root| mentions?(identity.name, root.body) }.or(false)
+  let joined = messages.any? { |message| message.userId == identity.id }
+  let waiting = messages.last.map { |newest| !newest.bot? }.or(false)
+  (asked || joined) && waiting
+end
+
+# An answer as the messages it is sent as: whole when it fits, and
+# otherwise cut between paragraphs where it can be.
+pieces : String -> Integer -> [String]
+let pieces(answer, longest) do
+  return [answer] if answer.chars.count <= longest
+
+  answer.split("\n\n")
+    .flatMap { |paragraph| chopped(paragraph, longest) }
+    .reduce([]) { |done, part| packed(done, part, longest) }
+end
+
+# The mode an answer chooses, if it is the answer to the mode question and
+# names one there is: `Mode: auto`.
+chosenMode : String -> String?
+let chosenMode(answer) do
+  let line = answer.split("\n").find { |each| each.trim.startsWith?("${MODE}: ") }.or("").trim
+  let named = line.drop(MODE.count + 2).trim
+  MODES.contains?(named) then Just(named) else None
+end
+
+# The AI an answer chooses, if it is the answer to the AI question and
+# names one there is: `AI: opencode`, or `AI: default`.
+foul chosenAI(bot: Bot, answer: String) -> String? do
+  let line = answer.split("\n").find { |each| each.trim.startsWith?("${AI}: ") }.or("").trim
+  let named = line.drop(AI.count + 2).trim
+  return None if line.empty? || named.empty?
+  return Just(DEFAULT) if named.lowerCase == DEFAULT
+  return Just(named.lowerCase) if bot.minds.has?(named.lowerCase)
+
+  None
+end
+
+# The model an answer chooses, if it is the answer to the model question
+# and names one: `Model: anthropic/claude-opus-4-5`. Whatever is named —
+# even `default`, which answers it back — as long as something is.
+chosenModel : String -> String?
+let chosenModel(answer) do
+  let line = answer.split("\n").find { |each| each.trim.startsWith?("${MODEL}: ") }.or("").trim
+  let named = line.drop(MODEL.count + 2).trim
+  line.empty? || named.empty? then None else Just(named)
+end
+
+# The question an operator is asked when they write `/mode`.
+modeQuestion : String -> String
+let modeQuestion(current) do
+  [
+    "This conversation is in *${current}* mode.",
+    "- *manual*: I ask before each tool I need permission for",
+    "- *auto*: the AI judges what is safe to do without asking",
+    "- *plan*: I work out a plan and change nothing",
+    "[?] ${MODE}: ${MODES.join(" | ")}"
+  ].join("\n")
+end
+
+# The question an operator is asked when they write `/model`: which AI, of
+# those the bot has — or `default`, the usual one. The model comes next.
+foul aiQuestion(bot: Bot, current: String) -> String do
+  [
+    "This conversation asks *${current}*. Pick an AI, then a model, or *default* for the usual one.",
+    "[?] ${AI}: ${([DEFAULT] + bot.minds.keys).join(" | ")}"
+  ].join("\n")
+end
+
+# The question that follows an AI: which of its models. As many as a
+# message has room for, in the order its catalog lists them.
+foul modelQuestion(bot: Bot, ai: String, models: [String]) -> String do
+  let fitting = models.reduce([]) { |kept, model|
+    [kept + [model]].map { |more| more.join(" | ").count <= MODELS_ROOM then more else kept }.first.or(kept)
+  }
+  [
+    "One of *${ai}*'s models:",
+    "[?] ${MODEL}: ${fitting.join(" | ")}"
+  ].join("\n")
+end
+
+# The question when an AI cannot say what models it has: one to type.
+foul typedModelQuestion(bot: Bot, ai: String, current: String) -> String do
+  [
+    "This conversation asks *${current}*.",
+    "Type a model as ${ai} takes it (its own command lists them), or `default` for the usual choice.",
+    "[?] ${MODEL}"
+  ].join("\n")
+end
+
+# The question an operator is asked when they write `/adopt`.
+foul adoptQuestion(bot: Bot, ai: String) -> String do
+  [
+    "Hand a session begun at the command line to this conversation, and it goes on from where that one left off:",
+    "- `/adopt <session id>` with ${ai}, the AI answering here",
+    "- `/adopt <ai> <session id>` with another of: ${bot.minds.keys.join(", ")}",
+    "The session id is the one the AI's own command shows or resumes."
+  ].join("\n")
+end
+
+# One full look at everything the bot can read, answering what is due. The
+# bot afterwards, knowing what it has now seen.
+polled : Bot -> Bot
+foul polled(bot) do
+  let after = bot.identity.organizations.reduce(bot) { |sofar, organization| surveyed(sofar, organization) }
+  return Bot { ...after, primed?: true }
+end
+
+# One thing Slick told the bot happened, looked at. The bot afterwards.
+foul told(bot: Bot, happening: Happening) -> Bot do
+  return bot if !bot.primed?
+  match happening.kind do
+    "answer" => return replied(bot, happening.organization)
+    "command" => return obeyed(bot, happening.organization)
+    "message" => return noticed(bot, happening)
+    _ => return bot
+  end
+end
+
+private do
+  # One organization's channels, group chats and private chats looked at.
+  foul surveyed(bot: Bot, organization: String) -> Bot do
+    match SlickAI.Slick.channels(bot.slick, organization) do
+      Ok(names) => do
+        let afterChannels = names.reduce(bot) { |sofar, name|
+          watched(sofar, organization, SlickAI.Slick.channel(name))
+        }
+        let afterGroups = match SlickAI.Slick.groups(bot.slick, organization) do
+          Ok(groups) => groups.reduce(afterChannels) { |sofar, id|
+            watched(sofar, organization, SlickAI.Slick.group(id))
+          }
+          Error(reason) => do
+            IO.printError("slick-ai-bot: ${reason}")
+            afterChannels
+          end
+        end
+        return obeyed(replied(confided(afterGroups, organization), organization), organization)
+      end
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # An organization's private chats looked at.
+  foul confided(bot: Bot, organization: String) -> Bot do
+    match SlickAI.Slick.chats(bot.slick, organization) do
+      Ok(people) => return people.reduce(bot) { |sofar, person|
+        heard(sofar, organization, SlickAI.Slick.chat(person))
+      }
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # One private chat looked at: when a person has written in it since the
+  # last look, it is answered, in the chat itself. Not only when a person
+  # wrote last: what was written while the bot was busy answering comes
+  # before that answer, and still has to be heard — a command above all.
+  foul heard(bot: Bot, organization: String, place: String) -> Bot do
+    match SlickAI.Slick.recent(bot.slick, organization, place) do
+      Ok(messages) => do
+        let fresh = messages.any? { |message| !message.bot? && !bot.seen.has?(message.id) }
+        let older = messages.count - REMEMBERED
+        let recent = older > 0 then messages.drop(older) else messages
+        let spoken = bot.primed? && fresh then answered(bot, organization, place, "", recent) else bot
+        let seen = messages.reduce(spoken.seen) { |sofar, message| sofar.put(message.id, message.replies) }
+        return Bot { ...spoken, seen: seen }
+      end
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # One channel or group chat looked at: every message that changed since
+  # the last look is attended to, and all of them are noted.
+  foul watched(bot: Bot, organization: String, place: String) -> Bot do
+    match SlickAI.Slick.recent(bot.slick, organization, place) do
+      Ok(messages) => return messages.reduce(bot) { |sofar, message|
+        let due = sofar.primed? && changed?(sofar.identity, sofar.seen.get(message.id), message)
+        let attendedTo = due then attended(sofar, organization, place, message) else sofar
+        Bot { ...attendedTo, seen: attendedTo.seen.put(message.id, message.replies) }
+      }
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # Whether a message needs looking at: it is new and asks for the bot, or
+  # it has replies it did not have before.
+  changed? : Identity -> Integer? -> Message -> Bool
+  let changed?(identity, None, message) do
+    !message.bot? && (mentions?(identity.name, message.body) || message.replies > 0)
+  end
+  let changed?(identity, Just(replies), message) = message.replies > replies
+
+  # One message that Slick told happened, looked at. In a channel or a
+  # group chat only what asks for the bot is answered — a message that names
+  # it, or a reply in a thread it is in. In a private chat everything is.
+  foul noticed(bot: Bot, happening: Happening) -> Bot do
+    if happening.place.startsWith?("dm/")
+      return heard(bot, happening.organization, happening.place)
+    end
+    if !happening.thread.empty?
+      return attendedThread(bot, happening.organization, happening.place, happening.thread)
+    end
+
+    match SlickAI.Slick.recent(bot.slick, happening.organization, happening.place) do
+      Ok(messages) => do
+        let found = messages.find { |message| message.id == happening.message }
+        let due = found.map { |message| !message.bot? }.or(false)
+        let after = due then answerThread(bot, happening.organization, happening.place, happening.message) else bot
+        let seen = messages.reduce(after.seen) { |sofar, message| sofar.put(message.id, message.replies) }
+        return Bot { ...after, seen: seen }
+      end
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # Reads a thread and answers it, without asking whether the bot was named
+  # in it: the stream has already decided this message is for the bot.
+  foul answerThread(bot: Bot, organization: String, place: String, root: String) -> Bot do
+    match SlickAI.Slick.thread(bot.slick, organization, place, root) do
+      Ok(messages) => do
+        let spoken = answered(bot, organization, place, root, messages)
+        let seen = messages.reduce(spoken.seen) { |sofar, message| sofar.put(message.id, message.replies) }
+        return Bot { ...spoken, seen: seen }
+      end
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # Reads a thread and, if the bot is due in it, answers there.
+  foul attendedThread(bot: Bot, organization: String, place: String, root: String) -> Bot do
+    match SlickAI.Slick.thread(bot.slick, organization, place, root) do
+      Ok(messages) => do
+        let spoken = due?(bot.identity, messages) then answered(bot, organization, place, root, messages) else bot
+        let seen = messages.reduce(spoken.seen) { |sofar, message| sofar.put(message.id, message.replies) }
+        return Bot { ...spoken, seen: seen }
+      end
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # Reads a message's thread and, if the bot is due in it, answers there.
+  foul attended(bot: Bot, organization: String, place: String, root: Message) -> Bot do
+    match SlickAI.Slick.thread(bot.slick, organization, place, root.id) do
+      Ok(messages) => do
+        return due?(bot.identity, messages) then answered(bot, organization, place, root.id, messages) else bot
+      end
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # An organization's answers to the bot's own forms looked at: each new
+  # one is acted on, oldest first.
+  foul replied(bot: Bot, organization: String) -> Bot do
+    match SlickAI.Slick.answers(bot.slick, organization, bot.answeredAt) do
+      Ok(replies) => do
+        let acted = replies.reduce(bot) { |sofar, reply| sofar.primed? then settled(sofar, organization, reply) else sofar }
+        let newest = replies.reduce(bot.answeredAt) { |latest, reply| reply.answeredAt > latest then reply.answeredAt else latest }
+        return Bot { ...acted, answeredAt: newest }
+      end
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # The slash commands used for it since the last look, each acted on —
+  # except on its first look, which only takes note of where it is.
+  foul obeyed(bot: Bot, organization: String) -> Bot do
+    match SlickAI.Slick.invocations(bot.slick, organization, bot.invokedAt) do
+      Ok(uses) => do
+        let acted = uses.reduce(bot) { |sofar, use| sofar.primed? then commandUsed(sofar, organization, use) else sofar }
+        let newest = uses.reduce(bot.invokedAt) { |latest, use| use.invokedAt > latest then use.invokedAt else latest }
+        return Bot { ...acted, invokedAt: newest }
+      end
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
+      end
+    end
+  end
+
+  # Which AI and model answer a conversation from now on; `default` is the
+  # usual AI and its own choice again. Said where it was chosen.
+  foul modelSet(bot: Bot, organization: String, place: String, thread: String, ai: String, model: String) -> Bot do
+    let key = "${organization}/${place}"
+    let usual = model.lowerCase == DEFAULT
+    let asking = ai.lowerCase == DEFAULT
+    let words = if asking
+      "This conversation asks the usual AI now."
+    else
+      usual then "This conversation asks *${ai}* now, with its own model." else "This conversation asks *${ai}* now, with *${model}*."
+    end
+    says(bot, organization, place, thread, words)
+    let chosen = asking then bot.chosen.delete(key) else bot.chosen.put(key, ai)
+    let models = asking || usual then bot.models.delete(key) else bot.models.put(key, model)
+    return Bot { ...bot, chosen: chosen, models: models }
+  end
+
+  # Acts on one slash command, where it was used. Only an operator decides
+  # what these change; anybody else is told so.
+  foul commandUsed(bot: Bot, organization: String, use: SlickAI.Slick.Use) -> Bot do
+    let key = "${organization}/${use.place}"
+    return bot if !["mode", "model", "adopt"].contains?(use.command)
+
+    if !bot.operators.contains?(use.userId)
+      let asker = Given { message: "", userId: use.userId, author: use.author }
+      says(bot, organization, use.place, use.thread, strangers(asker))
+      return bot
+    end
+    let wanted = use.arguments.trim.lowerCase
+    if use.command == "mode" && MODES.contains?(wanted)
+      says(bot, organization, use.place, use.thread, "This conversation is in *${wanted}* mode now.")
+      return Bot { ...bot, modes: bot.modes.put(key, wanted) }
+    end
+    if use.command == "mode"
+      says(bot, organization, use.place, use.thread, modeQuestion(bot.modes.get(key).or("manual")))
+      return bot
+    end
+    if use.command == "adopt"
+      return adopted(bot, organization, use.place, use.thread, use.arguments)
+    end
+    if use.command == "model" && !use.arguments.trim.empty?
+      let words = use.arguments.trim.split(" ")
+      if words.count == 1 && bot.minds.has?(words.first.or("").lowerCase)
+        return modelSet(bot, organization, use.place, use.thread, words.first.or("").lowerCase, DEFAULT)
+      end
+      if words.count == 1
+        return modelSet(bot, organization, use.place, use.thread, answering(bot, key), use.arguments.trim)
+      end
+      return modelSet(bot, organization, use.place, use.thread, words.first.or("").lowerCase, words.drop(1).join(" "))
+    end
+    if use.command == "model"
+      let current = bot.models.get(key).or(answering(bot, key))
+      says(bot, organization, use.place, use.thread, aiQuestion(bot, current))
+      return bot
+    end
+    return bot
+  end
+
+  # Hands a session over: `/adopt <session id>`, or `/adopt <ai> <session
+  # id>`. The conversation goes on from where that one left off, with only
+  # what is new said to it.
+  foul adopted(bot: Bot, organization: String, place: String, thread: String, arguments: String) -> Bot do
+    let key = "${organization}/${place}"
+    let words = arguments.trim.split(" ").reject { |word| word.empty? }
+    let ai = answering(bot, key)
+    if words.count == 0
+      says(bot, organization, place, thread, adoptQuestion(bot, ai))
+      return bot
+    end
+    if words.count == 1
+      if !SlickAI.Mind.tooled?(minding(bot, ai))
+        says(bot, organization, place, thread, "*${ai}* keeps no sessions here; there is nothing to hand over.")
+        return bot
+      end
+      says(bot, organization, place, thread, "This conversation goes on from the session *${words.first.or("")}* with *${ai}*. Say what you want next.")
+      return Bot { ...bot, sessions: bot.sessions.put(sessionKey(key, ai), words.first.or("")) }
+    end
+    let named = words.first.or("").lowerCase
+    if !bot.minds.has?(named)
+      says(bot, organization, place, thread, "I have no AI called *${named}*. I have: ${bot.minds.keys.join(", ")}.")
+      return bot
+    end
+    let rest = words.drop(1).join(" ")
+    says(bot, organization, place, thread, "This conversation asks *${named}* now, going on from the session *${rest}*. Say what you want next.")
+    return Bot { ...bot, chosen: bot.chosen.put(key, named), sessions: bot.sessions.put(sessionKey(key, named), rest) }
+  end
+
+  # Acts on one answer to one of the bot's forms: a mode chosen, an AI or a
+  # model chosen, a tool allowed or refused, or the answer to a question
+  # the AI asked.
+  foul settled(bot: Bot, organization: String, reply: Given) -> Bot do
+    let key = "${organization}/${reply.place}"
+    let operator? = bot.operators.contains?(reply.userId)
+    let decided = decision(reply.answer)
+    let mode = chosenMode(reply.answer)
+    let ai = chosenAI(bot, reply.answer)
+    let model = chosenModel(reply.answer)
+
+    # What only an operator decides.
+    if (decided.set? || mode.set? || ai.set? || model.set?) && !operator?
+      says(bot, organization, reply.place, reply.thread, strangers(reply))
+      return bot
+    end
+    if mode.set?
+      let chosen = mode.or("manual")
+      says(bot, organization, reply.place, reply.thread, "This conversation is in *${chosen}* mode now.")
+      return Bot { ...bot, modes: bot.modes.put(key, chosen) }
+    end
+    # An AI chosen is asked about its models next; `default` answers it
+    # back to the usual one.
+    if ai.set? && ai.or("").lowerCase != DEFAULT
+      let named = ai.or("")
+      match SlickAI.Mind.catalog(minding(bot, named)) do
+        Ok(models) => says(bot, organization, reply.place, reply.thread, modelQuestion(bot, named, models))
+        Error(_) => says(bot, organization, reply.place, reply.thread, typedModelQuestion(bot, named, bot.models.get(key).or(named)))
+      end
+      return Bot { ...bot, chosen: bot.chosen.put(key, named) }
+    end
+    if ai.set?
+      return modelSet(bot, organization, reply.place, reply.thread, DEFAULT, DEFAULT)
+    end
+    if model.set?
+      return modelSet(bot, organization, reply.place, reply.thread, answering(bot, key), model.or(DEFAULT))
+    end
+
+    # A decision about a tool counts for one the bot is waiting to hear about.
+    let waiting = bot.pending.get(key).or([])
+    return bot if decided.map { |made| !waiting.contains?(made.tool) }.or(false)
+
+    let granted = decided.map { |made| allowing(bot.granted, key, made) }.or(bot.granted)
+    let unanswered = decided.map { |made| waiting.reject { |tool| tool == made.tool } }.or(waiting)
+    let heard = Bot { ...bot, granted: granted, pending: bot.pending.put(key, unanswered) }
+    let news = decided.map { |made| ruling(reply.author, made) }.or("${reply.author} answered your form:\n${reply.answer}")
+    match gathered(bot, organization, reply.place, reply.thread) do
+      Ok(messages) => return continued(heard, organization, reply.place, reply.thread, messages, news, operator?)
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return heard
+      end
+    end
+  end
+
+  # The conversation an answer belongs to, as the messages said in it: a
+  # thread, or the newest of a conversation.
+  foul gathered(bot: Bot, organization: String, place: String, root: String) -> Result<[Message], String> do
+    return SlickAI.Slick.thread(bot.slick, organization, place, root) if !root.empty?
+
+    return SlickAI.Slick.recent(bot.slick, organization, place).map { |messages|
+      let older = messages.count - REMEMBERED
+      older > 0 then messages.drop(older) else messages
+    }
+  end
+
+  # Answers the newest message of a conversation: in the thread of `root`,
+  # or in the conversation itself when `root` is "".
+  foul answered(bot: Bot, organization: String, place: String, root: String, messages: [Message]) -> Bot do
+    let key = "${organization}/${place}"
+    # What is answered is the newest thing a person said: the bot's own
+    # answer to something earlier may have come after it.
+    let newest = messages.filter { |message| !message.bot? }.last.or(Message { id: "" })
+    let operator? = bot.operators.contains?(newest.userId)
+    let words = newest.body.trim.lowerCase.split(" ")
+
+    # An operator asking how tools are let through is asked back, as a form.
+    if words.contains?(MODE_ASKED) && operator?
+      says(bot, organization, place, root, modeQuestion(bot.modes.get(key).or("manual")))
+      return bot
+    end
+    if words.contains?(MODE_ASKED)
+      says(bot, organization, place, root, strangers(Given { message: "", userId: newest.userId, author: newest.author }))
+      return bot
+    end
+
+    # An operator asking which AI answers is asked back, as a form.
+    if words.contains?(MODEL_ASKED) && operator?
+      let current = bot.models.get(key).or(answering(bot, key))
+      says(bot, organization, place, root, aiQuestion(bot, current))
+      return bot
+    end
+    if words.contains?(MODEL_ASKED)
+      says(bot, organization, place, root, strangers(Given { message: "", userId: newest.userId, author: newest.author }))
+      return bot
+    end
+
+    # An operator handing a session over without the slash command.
+    if words.first.or("").lowerCase == ADOPT_ASKED && operator?
+      return adopted(bot, organization, place, root, newest.body.trim.drop(ADOPT_ASKED.count).trim)
+    end
+    return continued(bot, organization, place, root, messages, "", operator?)
+  end
+
+  # Asks an AI to go on with a conversation and says what it answers. `news`
+  # is what it is told has happened since it last spoke, when that is not a
+  # message — a tool allowed, a form answered; "" when the newest message is
+  # the news. The bot afterwards: it may have a session for the
+  # conversation now, and tools it is waiting to hear about.
+  foul continued(bot: Bot, organization: String, place: String, root: String, messages: [Message], news: String, operator?: Bool) -> Bot do
+    let key = "${organization}/${place}"
+    SlickAI.Slick.noting(bot.slick, organization, place, THINKING, THINKING_SECONDS)
+    let ai = answering(bot, key)
+    let mind = minding(bot, ai)
+    let tooled = !bot.operators.empty? && SlickAI.Mind.tooled?(mind)
+    let mode = operator? then bot.modes.get(key).or("manual") else "manual"
+    let granted = bot.granted.get(key).or([])
+    let offered = SlickAI.Mind.offered(mind)
+
+    # What an operator allowed, and the mode an operator chose, are for
+    # the turns an operator asks for.
+    var allowed : [String] = []
+    if tooled && operator? && SlickAI.Mind.gated?(mind)
+      allowed = mode == "auto" then offered else granted.filter { |tool| offered.contains?(tool) }
+    end
+    if tooled && operator? && !SlickAI.Mind.gated?(mind)
+      allowed = granted
+    end
+
+    # A conversation is a session with the AI, when it keeps one, so that
+    # what a tool found is still known on the next turn. A session handed
+    # over (/adopt) is one already: it carries its own history, and only
+    # what is new is said to it.
+    var sessions = bot.sessions
+    let had = sessions.has?(sessionKey(key, ai))
+    var session = sessions.get(sessionKey(key, ai)).or("")
+    if session.empty? && tooled
+      session = SlickAI.Mind.begins(mind)
+      sessions = sessions.put(sessionKey(key, ai), session) if !session.empty?
+    end
+    let said = conversation(bot.identity.id, messages)
+    let turns = news.empty? then said else followed(said, Turn { role: "user", text: news })
+    # What is asked is the whole conversation on a first turn in a session
+    # — and always, with an AI that keeps no session and so knows nothing
+    # of what was said before. On any other turn only the newest thing said.
+    let whole = !had || !tooled
+    let ask = Ask {
+      prompt: whole then SlickAI.Mind.transcript(turns) else turns.last.map { |turn| turn.text }.or(""),
+      session: session,
+      model: bot.models.get(key).or(""),
+      allowed: allowed,
+      askable: tooled && mode == "manual" && SlickAI.Mind.gated?(mind) then offered else [],
+      mode: tooled && operator? then mode else ""
+    }
+    let system = briefing(bot, ai, organization)
+    match SlickAI.Mind.answered(mind, system, turns, ask) do
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        says(bot, organization, place, root, "I could not answer that: ${reason}")
+        return Bot { ...bot, sessions: sessions }
+      end
+      Ok(answer) => do
+        let silent = answer.text.trim.lowerCase == SILENT
+        if !answer.text.empty? && !silent
+          says(bot, organization, place, root, answer.text)
+        end
+        # One question for each tool refused that may yet be allowed: in
+        # manual mode only, since auto leaves it to the AI and plan to
+        # nobody — except with one that names its own tools, which are
+        # asked about however the mode is set, each by its own name.
+        var pending = bot.pending.get(key).or([])
+        if !answer.session.empty? && tooled
+          sessions = sessions.put(sessionKey(key, ai), answer.session)
+        end
+        let asking = mode == "manual" || !SlickAI.Mind.gated?(mind)
+        if tooled && asking
+          let wanted = answer.wanted.map { |want| want.tool }.uniq
+          let tools = SlickAI.Mind.gated?(mind) then wanted.filter { |tool| offered.contains?(tool) } else wanted
+          tools.filter { |tool| !granted.contains?(tool) }.each { |tool|
+            let want = answer.wanted.find { |each| each.tool == tool }.or(Want { tool: tool })
+            says(bot, organization, place, root, request(want))
+          }
+          pending = tools.reduce(pending) { |named, tool| named.contains?(tool) then named else named + [tool] }
+        end
+        return Bot { ...bot, sessions: sessions, pending: bot.pending.put(key, pending) }
+      end
+    end
+  end
+
+  # The sessions map's key for one AI in one conversation.
+  sessionKey : String -> String -> String
+  let sessionKey(key, ai) = "${key}|${ai}"
+
+  # Says something, as the messages it fits in.
+  foul says(bot: Bot, organization: String, place: String, root: String, words: String) -> Void do
+    pieces(words, LONGEST).each { |piece|
+      match SlickAI.Slick.say(bot.slick, organization, place, root, piece) do
+        Error(reason) => IO.printError("slick-ai-bot: ${reason}")
+        Ok(_) => ()
+      end
+    }
+  end
+
+  # The tools allowed in a conversation after a decision: one more, or the
+  # same ones without it.
+  allowing : {String: [String]} -> String -> Decision -> {String: [String]}
+  let allowing(granted, key, made) do
+    let others = granted.get(key).or([]).reject { |tool| tool == made.tool }
+    granted.put(key, made.allowed? then others + [made.tool] else others)
+  end
+
+  # What the AI is told when an operator has decided.
+  ruling : String -> Decision -> String
+  let ruling(author, made) do
+    let allowed = "${author} allowed you to use ${made.tool} in this conversation. Carry on with what you were doing."
+    let refused = "${author} did not allow you to use ${made.tool}. Carry on without it, or say what you cannot do."
+    made.allowed? then allowed else refused
+  end
+
+  # What somebody who is not an operator is told when they answer a
+  # question only an operator decides.
+  strangers : Given -> String
+  let strangers(reply) do
+    "Only an operator of this bot can decide that. (${reply.author} is `${reply.userId}`, which is not among the operators.)"
+  end
+
+  # One message as a turn: the bot's own as the assistant's, and anyone
+  # else's as the user's, under their name.
+  spoken : String -> Message -> Turn
+  let spoken(botId, message) do
+    return Turn { role: "assistant", text: message.body } if message.userId == botId
+
+    Turn { role: "user", text: "${message.author}: ${message.body}" }
+  end
+
+  # The turns with one more: joined to the last when it is the same side's.
+  followed : [Turn] -> Turn -> [Turn]
+  let followed(turns, turn) do
+    match turns.last do
+      Just(previous) => do
+        return turns + [turn] if previous.role != turn.role
+
+        let joined = Turn { role: turn.role, text: "${previous.text}\n\n${turn.text}" }
+        turns.take(turns.count - 1) + [joined]
+      end
+      None => [turn]
+    end
+  end
+
+  # The messages so far with one more part: added to the last message when
+  # the two still fit in one.
+  packed : [String] -> String -> Integer -> [String]
+  let packed(done, part, longest) do
+    match done.last do
+      Just(current) => do
+        return done + [part] if current.chars.count + part.chars.count + 2 > longest
+
+        done.take(done.count - 1) + ["${current}\n\n${part}"]
+      end
+      None => [part]
+    end
+  end
+
+  # A paragraph as parts that each fit in one message: itself, or cut where
+  # it has to be.
+  chopped : String -> Integer -> [String]
+  let chopped(paragraph, longest) do
+    return [paragraph] if paragraph.chars.count <= longest
+
+    ["${paragraph.take(longest)}"] + chopped("${paragraph.drop(longest)}", longest)
+  end
+end

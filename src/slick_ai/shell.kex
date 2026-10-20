@@ -1,0 +1,14 @@
+# SlickAI.Shell — the one way to run another program.
+#
+# The local Muse, OpenCode and Claude Code are commands, and they are run
+# through here. A spec replaces it, the way it replaces `SlickAI.Wire`.
+capability SlickAI.Shell do
+  # Runs a program with its arguments, each passed as it is — no shell reads
+  # them — and stops it after `seconds`. Its exit code and what it printed.
+  foul run(command: String, arguments: [String], seconds: Integer) -> Result<(Integer, String), String> do
+    match Process.run(command, arguments, seconds * 1000) do
+      Ok(finished) => return Ok((finished.exitCode, finished.stdout))
+      Error(reason) => return Error(reason)
+    end
+  end
+end
