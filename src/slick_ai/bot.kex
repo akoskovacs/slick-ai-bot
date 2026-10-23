@@ -4,6 +4,9 @@
 # own name in Slick, whatever that is) is answered in that message's
 # thread. The thread is then a conversation — every reply a person makes
 # there is answered too, with the whole thread as what has been said so far.
+# A channel that lets its bots read all of it is a conversation itself:
+# what is said in it is answered in it, the way a private chat is, and only
+# replies in a thread are answered in the thread.
 #
 # In a private chat nobody has to name it: whatever a person writes there is
 # for the bot, and it answers in the chat itself, with the chat's newest
@@ -121,7 +124,32 @@ record Bot do
   answeredAt : Integer = 0
   # When the newest slash command used for it was used.
   invokedAt : Integer = 0
+  # The newest slash commands it has acted on, by id: each is acted on
+  # once, whatever `invokedAt` says.
+  handled : [String] = []
+  # How many times looking at Slick has failed. A first look that failed
+  # anywhere has not taken note of everything, and is taken again.
+  faults : Integer = 0
+  # The operators Slick says the bot has; together with `operators`, those
+  # it was started with.
+  appointed : [String] = []
 end
+
+# How many of the commands it acted on it remembers.
+let HANDLED = 200
+
+# What the AI is told when what it is to answer was said before its own
+# newest message: written while it was answering, or before it started
+# again.
+let MISSED = "That was said before your last answer, while you were writing it. Answer what in it is still unanswered; if your last answer already covers it, answer exactly \"no reply\"."
+
+# Whether somebody's word counts as an operator's.
+operates? : Bot -> String -> Bool
+let operates?(bot, id) = bot.operators.contains?(id) || bot.appointed.contains?(id)
+
+# Whether the bot has an operator at all.
+staffed? : Bot -> Bool
+let staffed?(bot) = !bot.operators.empty? || !bot.appointed.empty?
 
 # What somebody decided about a tool: `Permission for Bash: Allow`.
 record Decision do
@@ -220,6 +248,18 @@ let decision(body) do
   return None if line.empty? || parts.count != 2
 
   Just(Decision { tool: parts.first.or("").trim, allowed?: parts.last.or("").trim == "Allow" })
+end
+
+# What of an answer is said: nothing, when it is the answer that there is
+# nothing to add; and without a line that says only that, when more follows.
+unsilenced : String -> String
+let unsilenced(answer) do
+  let lines = answer.trim.split("\n")
+  let first = lines.first.or("").trim.lowerCase
+  let bare = first.endsWith?(".") then first.take(first.count - 1) else first
+  return answer.trim if bare != SILENT
+
+  lines.drop(1).join("\n").trim
 end
 
 # The question a refused tool is put to the people as.
@@ -351,13 +391,14 @@ end
 # bot afterwards, knowing what it has now seen.
 polled : Bot -> Bot
 foul polled(bot) do
-  let after = bot.identity.organizations.reduce(bot) { |sofar, organization| surveyed(sofar, organization) }
-  return Bot { ...after, primed?: true }
+  let current = appointing(bot)
+  let after = current.identity.organizations.reduce(current) { |sofar, organization| surveyed(sofar, organization) }
+  return Bot { ...after, primed?: bot.primed? || after.faults == current.faults }
 end
 
 # One thing Slick told the bot happened, looked at. The bot afterwards.
 foul told(bot: Bot, happening: Happening) -> Bot do
-  return bot if !bot.primed?
+  return polled(bot) if !bot.primed?
   match happening.kind do
     "answer" => return replied(bot, happening.organization)
     "command" => return obeyed(bot, happening.organization)
@@ -378,17 +419,11 @@ private do
           Ok(groups) => groups.reduce(afterChannels) { |sofar, id|
             watched(sofar, organization, SlickAI.Slick.group(id))
           }
-          Error(reason) => do
-            IO.printError("slick-ai-bot: ${reason}")
-            afterChannels
-          end
+          Error(reason) => faulted(afterChannels, reason)
         end
         return obeyed(replied(confided(afterGroups, organization), organization), organization)
       end
-      Error(reason) => do
-        IO.printError("slick-ai-bot: ${reason}")
-        return bot
-      end
+      Error(reason) => return faulted(bot, reason)
     end
   end
 
@@ -398,10 +433,7 @@ private do
       Ok(people) => return people.reduce(bot) { |sofar, person|
         heard(sofar, organization, SlickAI.Slick.chat(person))
       }
-      Error(reason) => do
-        IO.printError("slick-ai-bot: ${reason}")
-        return bot
-      end
+      Error(reason) => return faulted(bot, reason)
     end
   end
 
@@ -409,20 +441,27 @@ private do
   # last look, it is answered, in the chat itself. Not only when a person
   # wrote last: what was written while the bot was busy answering comes
   # before that answer, and still has to be heard — a command above all.
+  #
+  # What was written before the bot's own newest message is answered too,
+  # but the AI is told so: otherwise its own words are the newest it reads,
+  # and it answers them.
   foul heard(bot: Bot, organization: String, place: String) -> Bot do
     match SlickAI.Slick.recent(bot.slick, organization, place) do
       Ok(messages) => do
         let fresh = messages.any? { |message| !message.bot? && !bot.seen.has?(message.id) }
         let older = messages.count - REMEMBERED
         let recent = older > 0 then messages.drop(older) else messages
-        let spoken = bot.primed? && fresh then answered(bot, organization, place, "", recent) else bot
+        let behind = recent.last.map { |newest| newest.userId == bot.identity.id }.or(false)
+        let asker = recent.filter { |message| !message.bot? }.last.map { |message| message.userId }.or("")
+        let spoken = if !bot.primed? || !fresh
+          bot
+        else
+          behind then continued(bot, organization, place, "", recent, MISSED, operates?(bot, asker)) else answered(bot, organization, place, "", recent)
+        end
         let seen = messages.reduce(spoken.seen) { |sofar, message| sofar.put(message.id, message.replies) }
         return Bot { ...spoken, seen: seen }
       end
-      Error(reason) => do
-        IO.printError("slick-ai-bot: ${reason}")
-        return bot
-      end
+      Error(reason) => return faulted(bot, reason)
     end
   end
 
@@ -435,10 +474,7 @@ private do
         let attendedTo = due then attended(sofar, organization, place, message) else sofar
         Bot { ...attendedTo, seen: attendedTo.seen.put(message.id, message.replies) }
       }
-      Error(reason) => do
-        IO.printError("slick-ai-bot: ${reason}")
-        return bot
-      end
+      Error(reason) => return faulted(bot, reason)
     end
   end
 
@@ -451,10 +487,15 @@ private do
   let changed?(identity, Just(replies), message) = message.replies > replies
 
   # One message that Slick told happened, looked at. In a channel or a
-  # group chat only what asks for the bot is answered — a message that names
-  # it, or a reply in a thread it is in. In a private chat everything is.
+  # group chat that lets its bots read only what names them, that is what
+  # is answered — a message that names it, in its thread, or a reply in a
+  # thread it is in. In one that lets them read all of it, and in a private
+  # chat, what is said there is answered there.
   foul noticed(bot: Bot, happening: Happening) -> Bot do
     if happening.place.startsWith?("dm/")
+      return heard(bot, happening.organization, happening.place)
+    end
+    if happening.thread.empty? && happening.access == "all"
       return heard(bot, happening.organization, happening.place)
     end
     if !happening.thread.empty?
@@ -529,10 +570,7 @@ private do
         let newest = replies.reduce(bot.answeredAt) { |latest, reply| reply.answeredAt > latest then reply.answeredAt else latest }
         return Bot { ...acted, answeredAt: newest }
       end
-      Error(reason) => do
-        IO.printError("slick-ai-bot: ${reason}")
-        return bot
-      end
+      Error(reason) => return faulted(bot, reason)
     end
   end
 
@@ -541,14 +579,14 @@ private do
   foul obeyed(bot: Bot, organization: String) -> Bot do
     match SlickAI.Slick.invocations(bot.slick, organization, bot.invokedAt) do
       Ok(uses) => do
-        let acted = uses.reduce(bot) { |sofar, use| sofar.primed? then commandUsed(sofar, organization, use) else sofar }
+        let unhandled = uses.reject { |use| bot.handled.contains?(use.id) }
+        let acted = unhandled.reduce(bot) { |sofar, use| sofar.primed? then commandUsed(sofar, organization, use) else sofar }
         let newest = uses.reduce(bot.invokedAt) { |latest, use| use.invokedAt > latest then use.invokedAt else latest }
-        return Bot { ...acted, invokedAt: newest }
+        let handled = acted.handled + unhandled.map { |use| use.id }
+        let kept = handled.count > HANDLED then handled.drop(handled.count - HANDLED) else handled
+        return Bot { ...acted, invokedAt: newest, handled: kept }
       end
-      Error(reason) => do
-        IO.printError("slick-ai-bot: ${reason}")
-        return bot
-      end
+      Error(reason) => return faulted(bot, reason)
     end
   end
 
@@ -575,7 +613,7 @@ private do
     let key = "${organization}/${use.place}"
     return bot if !["mode", "model", "adopt"].contains?(use.command)
 
-    if !bot.operators.contains?(use.userId)
+    if !operates?(bot, use.userId)
       let asker = Given { message: "", userId: use.userId, author: use.author }
       says(bot, organization, use.place, use.thread, strangers(asker))
       return bot
@@ -644,7 +682,7 @@ private do
   # the AI asked.
   foul settled(bot: Bot, organization: String, reply: Given) -> Bot do
     let key = "${organization}/${reply.place}"
-    let operator? = bot.operators.contains?(reply.userId)
+    let operator? = operates?(bot, reply.userId)
     let decided = decision(reply.answer)
     let mode = chosenMode(reply.answer)
     let ai = chosenAI(bot, reply.answer)
@@ -712,7 +750,7 @@ private do
     # What is answered is the newest thing a person said: the bot's own
     # answer to something earlier may have come after it.
     let newest = messages.filter { |message| !message.bot? }.last.or(Message { id: "" })
-    let operator? = bot.operators.contains?(newest.userId)
+    let operator? = operates?(bot, newest.userId)
     let words = newest.body.trim.lowerCase.split(" ")
 
     # An operator asking how tools are let through is asked back, as a form.
@@ -753,7 +791,7 @@ private do
     SlickAI.Slick.noting(bot.slick, organization, place, THINKING, THINKING_SECONDS)
     let ai = answering(bot, key)
     let mind = minding(bot, ai)
-    let tooled = !bot.operators.empty? && SlickAI.Mind.tooled?(mind)
+    let tooled = staffed?(bot) && SlickAI.Mind.tooled?(mind)
     let mode = operator? then bot.modes.get(key).or("manual") else "manual"
     let granted = bot.granted.get(key).or([])
     let offered = SlickAI.Mind.offered(mind)
@@ -801,9 +839,9 @@ private do
         return Bot { ...bot, sessions: sessions }
       end
       Ok(answer) => do
-        let silent = answer.text.trim.lowerCase == SILENT
-        if !answer.text.empty? && !silent
-          says(bot, organization, place, root, answer.text)
+        let words = unsilenced(answer.text)
+        if !words.empty?
+          says(bot, organization, place, root, words)
         end
         # One question for each tool refused that may yet be allowed: in
         # manual mode only, since auto leaves it to the AI and plan to
@@ -824,6 +862,25 @@ private do
           pending = tools.reduce(pending) { |named, tool| named.contains?(tool) then named else named + [tool] }
         end
         return Bot { ...bot, sessions: sessions, pending: bot.pending.put(key, pending) }
+      end
+    end
+  end
+
+  # A look at Slick that failed: said, and counted.
+  foul faulted(bot: Bot, reason: String) -> Bot do
+    IO.printError("slick-ai-bot: ${reason}")
+    return Bot { ...bot, faults: bot.faults + 1 }
+  end
+
+  # The bot with the operators Slick now says it has — kept as they were
+  # when Slick cannot be asked, or does not say. Not a fault: nothing goes
+  # unnoted for it.
+  foul appointing(bot: Bot) -> Bot do
+    match SlickAI.Slick.me(bot.slick) do
+      Ok(identity) => return identity.operators? then Bot { ...bot, appointed: identity.operators } else bot
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${reason}")
+        return bot
       end
     end
   end

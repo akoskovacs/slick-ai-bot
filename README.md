@@ -26,15 +26,29 @@ old bot can be kept.
 
 ### Operators
 
-An AI has no tools unless operators are named — the people whose answer to
-"Permission for Bash: Allow | Deny" counts, and the only ones who may
+An AI has no tools unless the bot has operators — the people whose answer
+to "Permission for Bash: Allow | Deny" counts, and the only ones who may
 choose the mode, the model, or hand a session over.
+
+They are chosen in Slick: the Bots dialog, *Operators*, by the bot's owner
+or a workspace administrator. The bot reads them when it starts and again
+on every full look. More can be named where the bot runs, for a Slick
+that does not keep them:
 
 ```
 SLICK_OPERATORS=u1791…,u4823… tey all
 ```
 
 `BOT_OPERATORS` reads the same, for a `.env` written for the old bots.
+Whether the AIs have tools at all is decided when the bot starts: start
+it again after giving a bot without operators its first one.
+
+### What it remembers
+
+Its sessions — adopted ones too — and each conversation's AI, model, mode
+and allowed tools are kept in `work/state.json` (`SLICK_STATE`), with how
+far it has read the commands and the answers to its forms. Started again,
+it goes on from there and does not act on a command twice.
 
 ### Choosing what answers
 
@@ -79,7 +93,9 @@ How much a bot reads of a channel is the channel's own setting in Slick —
   in, and answers those (the safe default).
 - **all** — the bot reads the whole channel and takes part naturally: it
   judges each message and stays quiet when it has nothing to add, rather
-  than waiting to be named.
+  than waiting to be named. What is said in the channel is answered in the
+  channel, and a reply in a thread in that thread; several messages in a
+  row are answered once.
 - **none** — the bot reads and hears nothing of it.
 
 The bot's private chats are always its own to read, whatever a channel's
@@ -95,7 +111,10 @@ SLICK_TOKEN        the bot's token, from Slick's Bots dialog
 SLICK_OPERATORS    who may allow a tool (see above)
 SLICK_POLL_SECONDS how often Slick is looked at when it cannot tell the
                    bot what happens; every 2 seconds unless set
-PROVIDERS          with `tey all`, which AIs the bot offers; all unless set
+PROVIDERS          with `tey all`, which AIs the bot offers, the first one
+                   answering unless a conversation chooses; all unless set,
+                   Muse answering
+SLICK_STATE        what the bot remembers; work/state.json unless set
 ```
 
 Each AI is configured as its old bot was — `MUSE_*`, `OPENCODE_*`,

@@ -24,6 +24,7 @@
 # is taken out of its words (`Mind.Answer.wanted`, `Mind.transcript`).
 module SlickAI.Muse
 
+using JSON
 using Random
 using SlickAI.Mind, only: [Ask, Answer, Want]
 
@@ -59,7 +60,7 @@ let arguments(local, system, ask) do
   let model = !ask.model.empty? then ["--model", ask.model] else (local.model.empty? then [] else ["--model", local.model])
   let effort = local.effort.empty? then [] else ["--reasoning-effort", local.effort]
   let session = ask.session.empty? then ["--no-session-log"] else ["--session-id", ask.session]
-  ["exec"] + gated(ask.allowed) + model + effort + session + ["${system}\n\n${ask.prompt}"]
+  ["exec", "--json"] + gated(ask.allowed) + model + effort + session + ["${system}\n\n${ask.prompt}"]
 end
 
 # A new session for a conversation to go on in: a random UUID, which is
@@ -71,15 +72,38 @@ foul session() -> String do
   "${hex.take(8)}-${hex.drop(8).take(4)}-4${hex.drop(13).take(3)}-${v}${hex.drop(17).take(3)}-${hex.drop(20)}"
 end
 
-# What Muse said: whatever it printed, when it exited well and printed
-# something — the `NEED TOOL` lines taken out of its words, and kept as what
-# it was refused on the way to.
+# What Muse said, when it exited well and said something — the `NEED TOOL`
+# lines taken out of its words, and kept as what it was refused on the way
+# to. With `--json` it prints one event a line, and what it said is the text
+# of the run's end alone: the text of each step of the run is printed too,
+# one after another without a break, and is not the answer.
 said : Integer -> String -> Result<Answer, String>
 let said(exitCode, printed) do
-  let words = cleaned(printed)
+  let ending = finished(printed)
+  let words = cleaned(ending)
   return Error("muse exited ${exitCode} without an answer") if exitCode != 0 || words.empty?
 
-  Ok(Answer { text: words, wanted: wants(printed) })
+  Ok(Answer { text: words, wanted: wants(ending) })
+end
+
+# The text a run ended with, out of the events `muse exec --json` printed:
+# that of its last `run.terminal.completed`. What it printed, when none of
+# it is an event — a Muse from before `--json`.
+finished : String -> String
+let finished(printed) do
+  let lines = printed.split("\n").map { |line| line.trim }.filter { |line| line.startsWith?("{") }
+  return printed if lines.empty?
+
+  lines.reduce("") { |found, line|
+    match JSON.parse(line) do
+      Ok(value) => do
+        let fields : {String: Any} = value
+        let payload : {String: Any} = fields.get("payload").or({})
+        "${fields.get("payload_type").or("")}" == "run.terminal.completed" then "${payload.get("text").or("")}" else found
+      end
+      Error(_) => found
+    end
+  }
 end
 
 # Asks the local Muse.

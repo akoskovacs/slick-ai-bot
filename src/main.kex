@@ -12,21 +12,30 @@
 # older Slick, or a network in the way — the bot looks instead, every
 # SLICK_POLL_SECONDS, the way the old bots always did.
 #
-# An AI has no tools unless operators are named: the people whose answer
+# An AI has no tools unless the bot has operators: the people whose answer
 # to "Permission for Bash: Allow | Deny" counts, and the only ones who may
-# choose the mode, the model, or hand a session over.
+# choose the mode, the model, or hand a session over. They are chosen in
+# Slick's Bots dialog, and SLICK_OPERATORS names more.
+#
+# What the bot knows of each conversation — its sessions, the AI, model
+# and mode chosen, the tools allowed, and how far it has read — is kept in
+# SLICK_STATE, so that starting it again forgets none of it.
 #
 #   SLICK_URL             where Slick is; http://127.0.0.1:4000 unless set
 #   SLICK_TOKEN           the bot's token, from Slick's Bots dialog; or
 #                         MUSE_TOKEN, OPENCODE_TOKEN or CLAUDE_TOKEN for
 #                         the command of that name
-#   SLICK_OPERATORS       the Slick ids of the people who may allow a tool
-#                         and choose what a conversation asks; BOT_OPERATORS
-#                         reads the same; none unless set
+#   SLICK_OPERATORS       the Slick ids of more people who may allow a tool
+#                         and choose what a conversation asks, beside those
+#                         chosen in Slick; BOT_OPERATORS reads the same
+#   SLICK_STATE           where what the bot knows is kept;
+#                         work/state.json unless set
 #   SLICK_POLL_SECONDS    how often Slick is looked at when it cannot tell
 #                         the bot what happens; every 2 seconds unless set
 #   PROVIDERS             with `tey all`, which AIs the bot offers, from
-#                         muse, opencode and claude; all of them unless set
+#                         muse, opencode and claude, the first named being
+#                         the one that answers unless a conversation chooses;
+#                         all of them, Muse first, unless set
 #
 # Muse:
 #   MUSE_COMMAND          the local Muse; `muse` unless set
@@ -65,6 +74,7 @@ using SlickAI.OpenCode, as: OpenCodeProvider
 using SlickAI.Claude, as: ClaudeProvider
 using SlickAI.Mind, only: [Mind, Muse, OpenCode, Code, Api]
 using SlickAI.Bot, only: [Bot]
+using FS
 using Net.HTTP.WebSocket, only: [Text, CloseMessage, Connection]
 
 foul failed(reason: String) -> Void do
@@ -168,7 +178,8 @@ foul chosen(command: String, tooled: Bool) -> ({String: Mind}, String) do
           _ => found
         end
       }
-      let usual = minds.has?("muse") then "muse" else minds.keys.first.or("")
+      let first = wanted.find { |name| minds.has?(name) }.or("")
+      let usual = named.empty? && minds.has?("muse") then "muse" else first
       return (minds, usual)
     end
   end
@@ -198,8 +209,9 @@ foul heard(bot: Bot, said: Told) -> (Bot, Integer) do
 end
 
 # The stream of what happens, until it goes; the bot afterwards, and how
-# far it has now been told.
-foul listening(bot: Bot, socket: Connection, cursor: Integer) -> (Bot, Integer) do
+# far it has now been told. What it knows is written down after each
+# telling.
+foul listening(bot: Bot, socket: Connection, cursor: Integer, state: String) -> (Bot, Integer) do
   var current = bot
   var far = cursor
   var open? = true
@@ -209,6 +221,7 @@ foul listening(bot: Bot, socket: Connection, cursor: Integer) -> (Bot, Integer) 
       Ok(Text(words)) => match SlickAI.Slick.read(words) do
         Ok(said) => do
           let (after, told) = heard(current, said)
+          SlickAI.State.saved(after, state)
           current = after
           far = told
         end
@@ -224,6 +237,17 @@ foul listening(bot: Bot, socket: Connection, cursor: Integer) -> (Bot, Integer) 
   return (current, far)
 end
 
+# Where what the bot knows is kept, in a directory that is there.
+foul remembering() -> String do
+  let path = ENV.get("SLICK_STATE").or("work/state.json").trim
+  let parts = path.split("/")
+  let folder = parts.take(parts.count - 1).join("/")
+  if !folder.empty? && !FS.Directory.exists?(folder)
+    FS.Directory.create(folder)
+  end
+  return path
+end
+
 main(args) do
   let command = args.first.or("all")
   let slick = Slick {
@@ -231,11 +255,12 @@ main(args) do
     token: token(command)
   }
   let operators = trusted()
-  let (minds, usual) = chosen(command, !operators.empty?)
   let pause = configured("SLICK_POLL_SECONDS", 2)
+  let state = remembering()
   match SlickAI.Slick.me(slick) do
     Error(reason) => failed(reason)
     Ok(identity) => do
+      let (minds, usual) = chosen(command, !operators.empty? || !identity.operators.empty?)
       let names = minds.entries.reduce([]) { |lines, entry|
         match entry do
           (name, mind) => lines + ["${name} (${SlickAI.Mind.named(mind)})"]
@@ -246,12 +271,13 @@ main(args) do
         Ok(_) => ()
         Error(reason) => IO.printError("slick-ai-bot: could not tell Slick its commands: ${reason}")
       end
-      var bot = Bot { slick: slick, minds: minds, usual: usual, identity: identity, operators: operators }
+      let started = Bot { slick: slick, minds: minds, usual: usual, identity: identity, operators: operators, appointed: identity.operators }
+      var bot = SlickAI.State.restored(started, state)
       var cursor = 0
       loop do
         match SlickAI.Wire.open(SlickAI.Slick.stream(slick, cursor)) do
           Ok(socket) => do
-            let (after, far) = listening(bot, socket, cursor)
+            let (after, far) = listening(bot, socket, cursor, state)
             bot = after
             cursor = far
           end
@@ -260,6 +286,7 @@ main(args) do
             # instead, the way the old bots always did.
             IO.printError("slick-ai-bot: ${reason}")
             bot = SlickAI.Bot.polled(bot)
+            SlickAI.State.saved(bot, state)
             Task.sleep(pause.seconds)
           end
         end

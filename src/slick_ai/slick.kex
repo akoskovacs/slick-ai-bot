@@ -30,6 +30,10 @@ record Identity do
   name : String
   # The addresses of the organizations it is in.
   organizations : [String] = []
+  # The people Slick says are its operators, by id — when Slick says:
+  # an older one does not, and then `operators?` is false.
+  operators : [String] = []
+  operators? : Bool = false
 end
 
 # One message, as far as the bot reads it.
@@ -91,6 +95,9 @@ record Happening do
   message : String = ""
   at : Integer = 0
   cursor : Integer = 0
+  # How much of the place the bot may read: "all", "mentions", or "" when
+  # Slick does not say.
+  access : String = ""
 end
 
 # The most messages of a channel looked at in one go.
@@ -104,7 +111,14 @@ foul me(slick) do
     let organization : {String: Any} = each
     "${organization.get("slug").or("")}"
   }
-  return Ok(Identity { id: text(fields, "id"), name: text(fields, "name"), organizations: slugs })
+  let operators : [Any] = fields.get("operators").or([])
+  return Ok(Identity {
+    id: text(fields, "id"),
+    name: text(fields, "name"),
+    organizations: slugs,
+    operators: operators.map { |each| "${each}" },
+    operators?: fields.has?("operators")
+  })
 end
 
 # A channel's place in its organization.
@@ -276,7 +290,8 @@ foul read(said) do
         thread: text(fields, "thread"),
         message: text(fields, "message"),
         at: whole(fields, "at"),
-        cursor: cursor
+        cursor: cursor,
+        access: text(fields, "access")
       }))
     end
   end

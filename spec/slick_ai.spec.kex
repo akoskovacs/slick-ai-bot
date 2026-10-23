@@ -1,4 +1,6 @@
 using JSON
+using FS
+using Random
 using SlickAI.Slick, only: [Slick, Identity, Message, Happening, Again, CaughtUp, One]
 using SlickAI.Claude, only: [Settings]
 using SlickAI.Mind, only: [Turn, Ask, Api, Code, Muse, OpenCode]
@@ -65,6 +67,7 @@ let told(message: Message, replies: Integer) -> {String: Any} do
   return fields
 end
 
+let ME = "GET http://slick.test/api/me"
 let CHANNELS = "GET http://slick.test/api/acme/channels"
 let GROUPS = "GET http://slick.test/api/acme/groups"
 let CHATS = "GET http://slick.test/api/acme/dm"
@@ -78,11 +81,19 @@ let ANSWER = "{\"content\":[{\"type\":\"text\",\"text\":\"It is 4.\"}],\"stop_re
 let answersSince(moment: Integer) -> String = "GET http://slick.test/api/acme/answers?after=${moment}"
 let usedSince(moment: Integer) -> String = "GET http://slick.test/api/acme/invocations?after=${moment}"
 
+# Ada's `/adopt` in #general, as Slick's API tells it.
+let ADOPTED = "[{\"id\":\"i1\",\"command\":\"adopt\",\"arguments\":\"s1\",\"channel\":\"general\",\"person\":\"\",\"group\":\"\",\"thread\":\"\",\"user\":\"u1\",\"author\":\"Ada\",\"invokedAt\":5}]"
+
+let DM_RECENT = "GET http://slick.test/api/acme/dm/u1/messages?limit=100"
+let DM_POST = "POST http://slick.test/api/acme/dm/u1/messages"
+let DM_STATUS = "POST http://slick.test/api/acme/dm/u1/status"
+
 # The script of one full look: an empty channel list with the messages the
 # bot is shown, and its thread.
 let script(recent: [Any], thread: [Any]) -> {String: String} do
   let none : {String: String} = {}
   return none
+    .put(ME, "{\"id\":\"b1\",\"name\":\"slick\",\"organizations\":[{\"slug\":\"acme\"}],\"operators\":[]}")
     .put(CHANNELS, "[{\"id\":\"c1\",\"name\":\"general\",\"topic\":\"\"}]")
     .put(GROUPS, "[]")
     .put(CHATS, "[]")
@@ -144,6 +155,42 @@ describe("SlickAI.Mind") do
   end
 end
 
+describe("SlickAI.Muse") do
+  it("answers with the text the run ended with, not every step's") do
+    let printed = [
+      "{\"payload_type\":\"run.output.delta\",\"payload\":{\"text\":\"no reply\"}}",
+      "{\"payload_type\":\"run.output.delta\",\"payload\":{\"text\":\"Hello\"}}",
+      "{\"payload_type\":\"run.terminal.completed\",\"payload\":{\"text\":\"Hello\"}}"
+    ].join("\n")
+    Assert.equal(SlickAI.Muse.finished(printed), "Hello")
+    Assert.equal(SlickAI.Muse.finished("Plain words"), "Plain words")
+  end
+end
+
+describe("SlickAI.State") do
+  it("keeps what the bot knows of each conversation across a start again") do
+    let path = "work/spec-state-${Random.secureBytes(4).hex}.json"
+    FS.Directory.create("work") if !FS.Directory.exists?("work")
+    let knowing = Bot {
+      slick: slick,
+      identity: identity,
+      sessions: {"acme/dm/u1|muse": "s1"},
+      granted: {"acme/dm/u1": ["Bash"]},
+      modes: {"acme/dm/u1": "auto"},
+      invokedAt: 5,
+      handled: ["i1"]
+    }
+    SlickAI.State.saved(knowing, path)
+    let back = SlickAI.State.restored(Bot { slick: slick, identity: identity }, path)
+    FS.File.delete(path)
+    Assert.equal(back.sessions, knowing.sessions)
+    Assert.equal(back.granted, knowing.granted)
+    Assert.equal(back.modes, knowing.modes)
+    Assert.equal(back.invokedAt, 5)
+    Assert.equal(back.handled, ["i1"])
+  end
+end
+
 describe("SlickAI.Bot, deciding") do
   let bot = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity, operators: ["u1"] }
 
@@ -174,6 +221,13 @@ describe("SlickAI.Bot, deciding") do
     Assert.equal(SlickAI.Bot.chosenModel("Model: anthropic/claude-opus-4-5"), Just("anthropic/claude-opus-4-5"))
     Assert.equal(SlickAI.Bot.chosenMode("Mode: auto"), Just("auto"))
     Assert.equal(SlickAI.Bot.decision("Permission for Bash: Allow").map { |made| (made.tool, made.allowed?) }, Just(("Bash", true)))
+  end
+
+  it("keeps quiet when the answer is that there is nothing to add") do
+    Assert.equal(SlickAI.Bot.unsilenced("no reply"), "")
+    Assert.equal(SlickAI.Bot.unsilenced("No reply."), "")
+    Assert.equal(SlickAI.Bot.unsilenced("no reply\nHello"), "Hello")
+    Assert.equal(SlickAI.Bot.unsilenced("No reply is needed, but thanks"), "No reply is needed, but thanks")
   end
 
   it("answers the AI it has chosen, and the usual one where nothing is chosen") do
@@ -231,6 +285,62 @@ describe("SlickAI.Bot, looking at Slick") do
     looked(primed, recorder, script([told(ada, 3)], [told(ada, 3), told(four, 0), told(stranger, 0)]))
     let posts = recorder.listed().or([]).filter { |call| call.startsWith?("${POST} ") }
     Assert.falsy(posts.any? { |call| call.contains?("allowed you to use") })
+  end
+
+  it("acts on a command once, even when it is told of it again") do
+    let recorder = Process.spawn(Recorder {})
+    let primed = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity, primed?: true }
+    let used = Happening { kind: "command", organization: "acme", place: "channels/general", cursor: 8 }
+    let answers = script([], []).put(usedSince(0), ADOPTED)
+
+    let once = lookedAt(primed, recorder, used, answers)
+    # As though it had lost how far it had read: the same command again.
+    lookedAt(Bot { ...once, invokedAt: 0 }, recorder, used, answers)
+    let refusals = recorder.listed().or([]).filter { |call| call.startsWith?("${POST} ") && call.contains?("Only an operator") }
+    Assert.equal(refusals.count, 1)
+    Assert.equal(once.handled, ["i1"])
+  end
+
+  it("takes its first look again when part of it failed") do
+    let recorder = Process.spawn(Recorder {})
+    let fresh = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity }
+    let failing = looked(fresh, recorder, script([], []).delete(CHANNELS))
+    Assert.falsy(failing.primed?)
+    Assert.truthy(looked(failing, recorder, script([], [])).primed?)
+  end
+
+  it("takes the operators Slick says it has") do
+    let recorder = Process.spawn(Recorder {})
+    let fresh = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity }
+    let me = "{\"id\":\"b1\",\"name\":\"slick\",\"organizations\":[{\"slug\":\"acme\"}],\"operators\":[\"u7\"]}"
+    let primed = looked(fresh, recorder, script([], []).put(ME, me))
+    Assert.truthy(SlickAI.Bot.operates?(primed, "u7"))
+    Assert.falsy(SlickAI.Bot.operates?(primed, "u1"))
+  end
+
+  it("answers a channel it reads whole in the channel, not in a thread") do
+    let recorder = Process.spawn(Recorder {})
+    let primed = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity, primed?: true }
+    let happening = Happening { kind: "message", organization: "acme", place: "channels/general", message: "m1", cursor: 9, access: "all" }
+    lookedAt(primed, recorder, happening, script([told(ada, 0)], []))
+    let posts = recorder.listed().or([]).filter { |call| call.startsWith?("${POST} ") }
+    Assert.equal(posts, ["${POST} {\"body\":\"It is 4.\"}"])
+  end
+
+  it("tells the AI when what it answers was said before its own last answer") do
+    let recorder = Process.spawn(Recorder {})
+    let primed = Bot { slick: slick, minds: {"claude": api}, usual: "claude", identity: identity, primed?: true }
+    let asked = Message { id: "m5", userId: "u1", author: "Ada", body: "and the other one?" }
+    let mine = Message { id: "m6", userId: "b1", author: "slick", bot?: true, body: "It is 4." }
+    let happening = Happening { kind: "message", organization: "acme", place: "dm/u1", message: "m6", cursor: 10 }
+    let answers = script([], [])
+      .put(DM_RECENT, JSON.stringify([told(asked, 0), told(mine, 0)]))
+      .put(DM_POST, JSON.stringify(told(mine, 0)))
+      .put(DM_STATUS, "{\"ok\":true}")
+    lookedAt(primed, recorder, happening, answers)
+    let asks = recorder.listed().or([]).filter { |call| call.startsWith?("${ASK} ") }
+    Assert.equal(asks.count, 1)
+    Assert.truthy(asks.first.or("").contains?("said before your last answer"))
   end
 end
 

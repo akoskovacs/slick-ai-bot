@@ -1,0 +1,101 @@
+# SlickAI.State — what the bot knows of each conversation, kept in a file.
+#
+#   let bot = SlickAI.State.restored(fresh, "work/state.json")
+#   SlickAI.State.saved(bot, "work/state.json")
+#
+# A bot that starts again would otherwise begin from nothing: every session
+# forgotten, adopted ones too, every mode, AI, model and tool allowed, and
+# how far it had read the commands and the answers to its forms — so that
+# old ones were acted on again. What it has seen of the messages is not
+# kept: its first look notes that again.
+module SlickAI.State
+
+using JSON
+using FS
+using SlickAI.Bot, only: [Bot]
+
+# The bot as the file says it was; the bot as it is when there is no file,
+# or nothing in it that can be read.
+restored : Bot -> String -> Bot
+foul restored(bot, path) do
+  match FS.File.read(path) do
+    Error(_) => return bot
+    Ok(written) => match JSON.parse(written) do
+      Error(reason) => do
+        IO.printError("slick-ai-bot: ${path} cannot be read, and is started again: ${reason}")
+        return bot
+      end
+      Ok(value) => do
+        let fields : {String: Any} = value
+        return Bot {
+          ...bot,
+          sessions: words(fields, "sessions"),
+          granted: lists(fields, "granted"),
+          pending: lists(fields, "pending"),
+          modes: words(fields, "modes"),
+          chosen: words(fields, "chosen"),
+          models: words(fields, "models"),
+          answeredAt: whole(fields, "answeredAt"),
+          invokedAt: whole(fields, "invokedAt"),
+          handled: listed(fields.get("handled").or([]))
+        }
+      end
+    end
+  end
+end
+
+# Writes down what the bot knows: whole, or not at all — it is written
+# beside the file, then put in its place.
+saved : Bot -> String -> Void
+foul saved(bot, path) do
+  let fields : {String: Any} = {
+    "sessions": bot.sessions,
+    "granted": bot.granted,
+    "pending": bot.pending,
+    "modes": bot.modes,
+    "chosen": bot.chosen,
+    "models": bot.models,
+    "answeredAt": bot.answeredAt,
+    "invokedAt": bot.invokedAt,
+    "handled": bot.handled
+  }
+  match FS.File.write("${path}.tmp", JSON.stringify(fields)) do
+    Ok(_) => do
+      if !FS.File.rename("${path}.tmp", path)
+        IO.printError("slick-ai-bot: could not write ${path}")
+      end
+    end
+    Error(reason) => IO.printError("slick-ai-bot: could not write ${path}: ${reason}")
+  end
+end
+
+private do
+  words : {String: Any} -> String -> {String: String}
+  let words(fields, name) do
+    let found : {String: Any} = fields.get(name).or({})
+    found.entries.reduce({}) { |sofar, entry|
+      match entry do
+        (key, value) => sofar.put(key, "${value}")
+      end
+    }
+  end
+
+  lists : {String: Any} -> String -> {String: [String]}
+  let lists(fields, name) do
+    let found : {String: Any} = fields.get(name).or({})
+    found.entries.reduce({}) { |sofar, entry|
+      match entry do
+        (key, value) => sofar.put(key, listed(value))
+      end
+    }
+  end
+
+  listed : Any -> [String]
+  let listed(value) do
+    let found : [Any] = value
+    found.map { |each| "${each}" }
+  end
+
+  whole : {String: Any} -> String -> Integer
+  let whole(fields, name) = "${fields.get(name).or(0)}".to(Integer).or(0)
+end
